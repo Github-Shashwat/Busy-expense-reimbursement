@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, CATEGORIES, money } from '../api';
+import { useAuth } from '../auth';
 
 type Line = {
   id: number;
@@ -27,7 +28,11 @@ const emptyLine = { spent_on: '', amount: '', category: 'travel', description: '
 
 export function ReportDetailPage() {
   const { id } = useParams();
+  const { user } = useAuth();
   const [report, setReport] = useState<Report | null>(null);
+  const [history, setHistory] = useState<{ events: any[]; comments: any[] }>({ events: [], comments: [] });
+  const [comment, setComment] = useState('');
+  const [rejectReason, setRejectReason] = useState('');
   const [error, setError] = useState('');
   const [msg, setMsg] = useState('');
   const [line, setLine] = useState(emptyLine);
@@ -36,6 +41,7 @@ export function ReportDetailPage() {
   async function load() {
     const data = await api<{ report: Report }>(`/api/reports/${id}`);
     setReport(data.report);
+    setHistory(await api(`/api/reports/${id}/history`));
   }
 
   useEffect(() => {
@@ -44,8 +50,11 @@ export function ReportDetailPage() {
 
   if (!report) return <p className="text-slate-500">{error || 'Loading…'}</p>;
 
+  const isOwner = user?.id === report.owner_id;
   const isDraft = report.status === 'draft';
-  const canEditDraft = isDraft && !report.archived_at;
+  const isApprover = user?.role === 'approver';
+  const canEditDraft = isOwner && isDraft && !report.archived_at;
+  const canDecide = isApprover && !isOwner;
 
   async function run(fn: () => Promise<unknown>, successMsg?: string) {
     setError('');
@@ -125,6 +134,35 @@ export function ReportDetailPage() {
       {msg && <p className="rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{msg}</p>}
 
       <div className="flex flex-wrap gap-2">
+        {canEditDraft && (
+          <button className="rounded bg-slate-900 px-3 py-1.5 text-sm text-white"
+            onClick={() => run(() => post(`/api/reports/${id}/submit`), 'Submitted')}>
+            Submit
+          </button>
+        )}
+
+        {canDecide && report.status === 'submitted' && (
+          <>
+            <button className="rounded bg-emerald-700 px-3 py-1.5 text-sm text-white"
+              onClick={() => run(() => post(`/api/reports/${id}/approve`), 'Approved')}>
+              Approve
+            </button>
+            <input className="rounded border px-2 py-1 text-sm" placeholder="Rejection reason"
+              value={rejectReason} onChange={(e) => setRejectReason(e.target.value)} />
+            <button className="rounded bg-red-700 px-3 py-1.5 text-sm text-white"
+              onClick={() => run(() => post(`/api/reports/${id}/reject`, { reason: rejectReason }), 'Rejected → draft')}>
+              Reject
+            </button>
+          </>
+        )}
+
+        {canDecide && report.status === 'approved' && (
+          <button className="rounded bg-blue-800 px-3 py-1.5 text-sm text-white"
+            onClick={() => run(() => post(`/api/reports/${id}/pay`), 'Marked paid')}>
+            Mark paid
+          </button>
+        )}
+
         {(report.status === 'draft' || report.status === 'paid') && !report.archived_at && (
           <button className="rounded border px-3 py-1.5 text-sm" onClick={() => run(() => post(`/api/reports/${id}/archive`), 'Archived')}>
             Archive
@@ -205,6 +243,37 @@ export function ReportDetailPage() {
             )}
           </form>
         )}
+
+      </section>
+
+      <section className="rounded border border-slate-200 bg-white p-4">
+        <h2 className="mb-3 font-medium">Timeline (immutable)</h2>
+        <ul className="space-y-2 text-sm">
+          {history.events.map((ev) => (
+            <li key={`e-${ev.id}`} className="border-l-2 border-slate-300 pl-3">
+              <span className="font-medium">{ev.old_status || '—'} → {ev.new_status}</span>{' '}
+              by {ev.actor_name} at {ev.created_at}
+              {ev.reason && <div className="text-slate-600">Reason: {ev.reason}</div>}
+            </li>
+          ))}
+          {history.comments.map((c) => (
+            <li key={`c-${c.id}`} className="border-l-2 border-blue-300 pl-3">
+              Comment by {c.author_name} at {c.created_at}: {c.body}
+            </li>
+          ))}
+        </ul>
+
+        <form className="mt-3 flex gap-2" onSubmit={(e) => {
+          e.preventDefault();
+          run(async () => {
+            await post(`/api/reports/${id}/comments`, { body: comment });
+            setComment('');
+          });
+        }}>
+          <input className="flex-1 rounded border px-2 py-1 text-sm" value={comment}
+            onChange={(e) => setComment(e.target.value)} placeholder="Add a comment" required />
+          <button className="rounded bg-slate-800 px-3 py-1 text-sm text-white">Post</button>
+        </form>
       </section>
     </div>
   );
