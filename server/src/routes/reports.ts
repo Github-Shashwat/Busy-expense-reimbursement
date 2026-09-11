@@ -34,7 +34,29 @@ function getReport(id: number): ReportRow | undefined {
     )
     .get(id) as ReportRow | undefined;
 }
+function getApprovers(reportId: number) {
+  return db
+    .prepare(
+      `SELECT u.id, u.name, u.email
+       FROM report_approvers ra
+       JOIN users u ON u.id = ra.approver_id
+       WHERE ra.report_id = ?
+       ORDER BY u.name, u.id`,
+    )
+    .all(reportId);
+}
 
+function isAssignedApprover(reportId: number, approverId: number) {
+  const row = db
+    .prepare(
+      `SELECT 1
+       FROM report_approvers
+       WHERE report_id = ? AND approver_id = ?`,
+    )
+    .get(reportId, approverId);
+
+  return Boolean(row);
+}
 function touchReport(id: number) {
   db.prepare(`UPDATE expense_reports SET updated_at = datetime('now') WHERE id = ?`).run(id);
 }
@@ -69,6 +91,13 @@ function decide(reportId: number, actorId: number, action: 'approve' | 'reject' 
   if (report.owner_id === actorId) {
     return { ok: false, code: 'self_owner', error: 'You cannot approve, reject, or mark paid a report you own. Another approver must decide.' };
   }
+  if (!isAssignedApprover(report.id, actorId)) {
+  return {
+    ok: false,
+    code: 'not_assigned',
+    error: 'You are not assigned to this report. Only an assigned approver can decide it.',
+  };
+}
 
   if (action === 'approve') {
     if (report.status !== 'submitted') {
@@ -116,7 +145,12 @@ function decide(reportId: number, actorId: number, action: 'approve' | 'reject' 
 
 function respondDecide(res: Response, reportId: number, result: ReturnType<typeof decide>) {
   if (!result.ok) {
-    const status = result.code === 'not_found' ? 404 : result.code === 'self_owner' ? 403 : 400;
+    const status =
+  result.code === 'not_found'
+    ? 404
+    : result.code === 'self_owner' || result.code === 'not_assigned'
+      ? 403
+      : 400;
     return res.status(status).json({ error: result.error });
   }
   res.json({ report: serializeReport(reportId) });
@@ -132,10 +166,22 @@ function assertDraftOwner(report: ReportRow, userId: number) {
 function serializeReport(id: number) {
   const report = getReport(id);
   if (!report) return null;
+
   const lines = db
-    .prepare(`SELECT * FROM expense_lines WHERE report_id = ? ORDER BY spent_on, id`)
+    .prepare(
+      `SELECT * FROM expense_lines
+       WHERE report_id = ?
+       ORDER BY spent_on, id`,
+    )
     .all(id);
-  return { ...report, lines };
+
+  const approvers = getApprovers(id);
+
+  return {
+    ...report,
+    lines,
+    approvers,
+  };
 }
 
 function loadOwnedDraft(req: Request, res: Response) {
@@ -191,6 +237,146 @@ reportsRouter.post('/', requireAuth, (req, res) => {
   res.status(201).json({ report: serializeReport(id) });
 });
 
+reportsRouter.get('/queue', requireAuth, requireApprover, (req, res) => {
+  const assignedToMe =
+    req.query.assignedToMe === '1' ||
+    req.query.assignedToMe === 'true';
+
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(
+    100,
+    Math.max(1, Number(req.query.pageSize) || 20),
+  );
+
+  const where = assignedToMe
+    ? `
+      WHERE expense_reports.status = 'submitted'
+        AND EXISTS (
+          SELECT 1
+          FROM report_approvers ra
+          WHERE ra.report_id = expense_reports.id
+            AND ra.approver_id = ?
+        )
+    `
+    : `
+      WHERE expense_reports.status = 'submitted'
+    `;
+
+  const params = assignedToMe
+    ? [req.user!.id]
+    : [];
+
+  const countRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total
+       FROM expense_reports
+       ${where}`,
+    )
+    .get(...params) as { total: number };
+
+  const total = Number(countRow.total);
+
+  const rows = db
+    .prepare(
+      `SELECT expense_reports.*, ${TOTAL_SQL} AS total_cents,
+              users.name AS owner_name,
+              users.email AS owner_email
+       FROM expense_reports
+       JOIN users ON users.id = expense_reports.owner_id
+       ${where}
+       ORDER BY expense_reports.submitted_at ASC,
+                expense_reports.id ASC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(...params, pageSize, (page - 1) * pageSize);
+
+  res.json({
+    items: rows,
+    total,
+    page,
+    pageSize,
+  });
+});
+
+reportsRouter.get('/:id/approvers', requireAuth, (req, res) => {
+  const report = getReport(Number(req.params.id));
+
+  if (!report) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  if (!canView(report, req.user!.id, req.user!.role)) {
+    return res.status(403).json({ error: 'You cannot view this report' });
+  }
+
+  res.json({ approvers: getApprovers(report.id) });
+});
+
+reportsRouter.post('/:id/approvers', requireAuth, (req, res) => {
+  const report = getReport(Number(req.params.id));
+
+  if (!report) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  if (report.owner_id !== req.user!.id) {
+    return res.status(403).json({
+      error: 'Only the report owner can manage approvers',
+    });
+  }
+
+  if (report.status !== 'draft') {
+    return res.status(400).json({
+      error: 'Approvers can only be assigned while the report is a draft',
+    });
+  }
+
+  const body = z
+    .object({
+      approver_id: z.number().int().positive(),
+    })
+    .safeParse(req.body);
+
+  if (!body.success) {
+    return res.status(400).json({
+      error: 'approver_id is required',
+    });
+  }
+
+  const approver = db
+    .prepare(
+      `SELECT id, role
+       FROM users
+       WHERE id = ?`,
+    )
+    .get(body.data.approver_id) as
+    | { id: number; role: string }
+    | undefined;
+
+  if (!approver) {
+    return res.status(404).json({
+      error: 'Approver not found',
+    });
+  }
+
+  if (approver.role !== 'approver') {
+    return res.status(400).json({
+      error: 'Only users with the approver role can be assigned',
+    });
+  }
+
+  db.prepare(
+    `INSERT OR IGNORE INTO report_approvers (report_id, approver_id)
+     VALUES (?, ?)`,
+  ).run(report.id, approver.id);
+
+  touchReport(report.id);
+
+  res.json({
+    approvers: getApprovers(report.id),
+  });
+});
+
 reportsRouter.patch('/:id', requireAuth, (req, res) => {
   const report = loadOwnedDraft(req, res);
   if (!report) return;
@@ -216,6 +402,7 @@ reportsRouter.patch('/:id', requireAuth, (req, res) => {
   res.json({ report: serializeReport(report.id) });
 });
 
+
 reportsRouter.get('/:id', requireAuth, (req, res) => {
   const report = getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
@@ -225,6 +412,47 @@ reportsRouter.get('/:id', requireAuth, (req, res) => {
   }
 
   res.json({ report: serializeReport(report.id) });
+});
+
+reportsRouter.delete('/:id/approvers/:approverId', requireAuth, (req, res) => {
+  const report = getReport(Number(req.params.id));
+
+  if (!report) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  if (report.owner_id !== req.user!.id) {
+    return res.status(403).json({
+      error: 'Only the report owner can manage approvers',
+    });
+  }
+
+  if (report.status !== 'draft') {
+    return res.status(400).json({
+      error: 'Approvers can only be changed while the report is a draft',
+    });
+  }
+
+  const approverId = Number(req.params.approverId);
+
+  const info = db
+    .prepare(
+      `DELETE FROM report_approvers
+       WHERE report_id = ? AND approver_id = ?`,
+    )
+    .run(report.id, approverId);
+
+  if (info.changes === 0) {
+    return res.status(404).json({
+      error: 'Approver assignment not found',
+    });
+  }
+
+  touchReport(report.id);
+
+  res.json({
+    approvers: getApprovers(report.id),
+  });
 });
 
 reportsRouter.post('/:id/archive', requireAuth, (req, res) => {
