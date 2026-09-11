@@ -199,21 +199,277 @@ function loadOwnedDraft(req: Request, res: Response) {
 }
 
 reportsRouter.get('/', requireAuth, (req, res) => {
-  const archived = req.query.archived === '1' || req.query.archived === 'true';
+  const user = req.user!;
+
+  const q = String(req.query.q || '').trim();
+  const status = String(req.query.status || '').trim();
+
+  const ownerId = req.query.ownerId
+    ? Number(req.query.ownerId)
+    : null;
+
+  const approverId = req.query.approverId
+    ? Number(req.query.approverId)
+    : null;
+
+  const assignedToMe =
+    req.query.assignedToMe === '1' ||
+    req.query.assignedToMe === 'true';
+
+  const archived =
+    req.query.archived === '1' ||
+    req.query.archived === 'true';
+
+  const mine =
+    req.query.mine === '1' ||
+    req.query.mine === 'true';
+
+  const sort = String(req.query.sort || 'created_at');
+
+  const order =
+    String(req.query.order || 'desc').toLowerCase() === 'asc'
+      ? 'ASC'
+      : 'DESC';
+
+  const page = Math.max(
+    1,
+    Number(req.query.page) || 1,
+  );
+
+  const pageSize = Math.min(
+    50,
+    Math.max(1, Number(req.query.pageSize) || 10),
+  );
+
+  const offset = (page - 1) * pageSize;
+
+  const where: string[] = [];
+  const params: (string | number)[] = [];
+
+  /*
+   * ---------------------------------------------------------
+   * 1. BASE AUTHORIZATION
+   * ---------------------------------------------------------
+   *
+   * Employees:
+   *   - only their own reports
+   *
+   * Approvers:
+   *   - their own reports
+   *   - other users' submitted/approved/paid reports
+   *
+   * An approver cannot see somebody else's draft.
+   */
+
+  if (user.role !== 'approver' || mine) {
+    where.push('expense_reports.owner_id = ?');
+    params.push(user.id);
+  } else {
+    where.push(
+      `(
+        expense_reports.owner_id = ?
+        OR expense_reports.status IN ('submitted', 'approved', 'paid')
+      )`,
+    );
+
+    params.push(user.id);
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * 2. SEARCH
+   * ---------------------------------------------------------
+   *
+   * Search report title and owner information.
+   */
+
+  if (q) {
+    where.push(
+      `(
+        expense_reports.title LIKE ?
+        OR users.name LIKE ?
+        OR users.email LIKE ?
+      )`,
+    );
+
+    const search = `%${q}%`;
+
+    params.push(search, search, search);
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * 3. STATUS FILTER
+   * ---------------------------------------------------------
+   */
+
+  if (status) {
+    const validStatuses = [
+      'draft',
+      'submitted',
+      'approved',
+      'paid',
+    ];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        error: 'Invalid status filter',
+      });
+    }
+
+    where.push('expense_reports.status = ?');
+    params.push(status);
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * 4. OWNER FILTER
+   * ---------------------------------------------------------
+   */
+
+  if (ownerId !== null) {
+    if (!Number.isInteger(ownerId) || ownerId <= 0) {
+      return res.status(400).json({
+        error: 'Invalid ownerId',
+      });
+    }
+
+    where.push('expense_reports.owner_id = ?');
+    params.push(ownerId);
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * 5. APPROVER FILTER
+   * ---------------------------------------------------------
+   */
+
+  if (approverId !== null) {
+    if (!Number.isInteger(approverId) || approverId <= 0) {
+      return res.status(400).json({
+        error: 'Invalid approverId',
+      });
+    }
+
+    where.push(
+      `EXISTS (
+        SELECT 1
+        FROM report_approvers ra
+        WHERE ra.report_id = expense_reports.id
+          AND ra.approver_id = ?
+      )`,
+    );
+
+    params.push(approverId);
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * 6. ASSIGNED-TO-ME FILTER
+   * ---------------------------------------------------------
+   */
+
+  if (assignedToMe) {
+    if (user.role !== 'approver') {
+      return res.status(403).json({
+        error: 'Only approvers can use assignedToMe',
+      });
+    }
+
+    where.push(
+      `EXISTS (
+        SELECT 1
+        FROM report_approvers ra
+        WHERE ra.report_id = expense_reports.id
+          AND ra.approver_id = ?
+      )`,
+    );
+
+    params.push(user.id);
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * 7. ARCHIVED FILTER
+   * ---------------------------------------------------------
+   */
+
+  where.push(
+    archived
+      ? 'expense_reports.archived_at IS NOT NULL'
+      : 'expense_reports.archived_at IS NULL',
+  );
+
+  /*
+   * ---------------------------------------------------------
+   * 8. SAFE SORTING
+   * ---------------------------------------------------------
+   *
+   * Never put raw user input directly into ORDER BY.
+   */
+
+  const sortColumns: Record<string, string> = {
+    created_at: 'expense_reports.created_at',
+    updated_at: 'expense_reports.updated_at',
+    submitted_at: 'expense_reports.submitted_at',
+    title: 'expense_reports.title',
+    total: 'total_cents',
+  };
+
+  const sortColumn =
+    sortColumns[sort] || sortColumns.created_at;
+
+  const whereSql = where.length
+    ? `WHERE ${where.join(' AND ')}`
+    : '';
+
+  /*
+   * ---------------------------------------------------------
+   * 9. TOTAL COUNT
+   * ---------------------------------------------------------
+   */
+
+  const countRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total
+       FROM expense_reports
+       JOIN users
+         ON users.id = expense_reports.owner_id
+       ${whereSql}`,
+    )
+    .get(...params) as { total: number };
+
+  const total = Number(countRow.total);
+
+  /*
+   * ---------------------------------------------------------
+   * 10. PAGINATED DATA
+   * ---------------------------------------------------------
+   */
 
   const rows = db
     .prepare(
-      `SELECT expense_reports.*, ${TOTAL_SQL} AS total_cents,
-              users.name AS owner_name, users.email AS owner_email
+      `SELECT expense_reports.*,
+              ${TOTAL_SQL} AS total_cents,
+              users.name AS owner_name,
+              users.email AS owner_email
        FROM expense_reports
-       JOIN users ON users.id = expense_reports.owner_id
-       WHERE expense_reports.owner_id = ?
-         AND ${archived ? 'expense_reports.archived_at IS NOT NULL' : 'expense_reports.archived_at IS NULL'}
-       ORDER BY expense_reports.created_at DESC, expense_reports.id DESC`,
+       JOIN users
+         ON users.id = expense_reports.owner_id
+       ${whereSql}
+       ORDER BY ${sortColumn} ${order},
+                expense_reports.id DESC
+       LIMIT ?
+       OFFSET ?`,
     )
-    .all(req.user!.id);
+    .all(...params, pageSize, offset);
 
-  res.json({ items: rows, total: rows.length, page: 1, pageSize: rows.length });
+  res.json({
+    items: rows,
+    total,
+    page,
+    pageSize,
+  });
 });
 
 reportsRouter.post('/', requireAuth, (req, res) => {
