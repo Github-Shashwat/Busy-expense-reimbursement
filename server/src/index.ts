@@ -5,6 +5,7 @@ import { migrate } from './db.js';
 import { seedDemoData } from './seed.js';
 import { authRouter } from './routes/auth.js';
 import { reportsRouter } from './routes/reports.js';
+import { dashboardRouter, exportRouter, alertsRouter } from './routes/misc.js';
 
 migrate();
 
@@ -22,6 +23,9 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.use('/api/auth', authRouter);
 app.use('/api/reports', reportsRouter);
+app.use('/api/dashboard', dashboardRouter);
+app.use('/api/exports', exportRouter);
+app.use('/api/alerts', alertsRouter);
 
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   if (err instanceof SyntaxError && 'body' in err) {

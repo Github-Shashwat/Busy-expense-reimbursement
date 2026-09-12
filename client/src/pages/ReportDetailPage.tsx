@@ -22,6 +22,7 @@ type Report = {
   total_cents: number;
   archived_at: string | null;
   lines: Line[];
+  approvers: { id: number; name: string; email: string }[];
 };
 
 const emptyLine = { spent_on: '', amount: '', category: 'travel', description: '' };
@@ -31,21 +32,27 @@ export function ReportDetailPage() {
   const { user } = useAuth();
   const [report, setReport] = useState<Report | null>(null);
   const [history, setHistory] = useState<{ events: any[]; comments: any[] }>({ events: [], comments: [] });
-  const [comment, setComment] = useState('');
-  const [rejectReason, setRejectReason] = useState('');
+  const [approverOptions, setApproverOptions] = useState<{ id: number; name: string }[]>([]);
+  const [selectedApprovers, setSelectedApprovers] = useState<number[]>([]);
   const [error, setError] = useState('');
   const [msg, setMsg] = useState('');
+  const [comment, setComment] = useState('');
+  const [rejectReason, setRejectReason] = useState('');
   const [line, setLine] = useState(emptyLine);
   const [editingLineId, setEditingLineId] = useState<number | null>(null);
 
   async function load() {
     const data = await api<{ report: Report }>(`/api/reports/${id}`);
     setReport(data.report);
+    setSelectedApprovers(data.report.approvers.map((a) => a.id));
     setHistory(await api(`/api/reports/${id}/history`));
   }
 
   useEffect(() => {
     load().catch((e) => setError(e.message));
+    api<{ approvers: { id: number; name: string }[] }>('/api/auth/approvers')
+      .then((d) => setApproverOptions(d.approvers))
+      .catch(() => {});
   }, [id]);
 
   if (!report) return <p className="text-slate-500">{error || 'Loading…'}</p>;
@@ -80,7 +87,6 @@ export function ReportDetailPage() {
       category: line.category,
       description: line.description,
     };
-
     await run(async () => {
       if (editingLineId) {
         await api(`/api/reports/${id}/lines/${editingLineId}`, { method: 'PATCH', json: payload });
@@ -95,7 +101,9 @@ export function ReportDetailPage() {
   return (
     <div className="space-y-6">
       <div>
-        <Link to="/reports" className="text-sm text-blue-700 hover:underline">← Back</Link>
+        <Link to="/reports" className="text-sm text-blue-700 hover:underline">
+          ← Back
+        </Link>
         <h1 className="mt-2 text-xl font-semibold">{report.title}</h1>
         <p className="text-sm text-slate-600">
           {report.owner_name} · <span className="capitalize">{report.status}</span> · {money(report.total_cents)} ·{' '}
@@ -135,42 +143,59 @@ export function ReportDetailPage() {
 
       <div className="flex flex-wrap gap-2">
         {canEditDraft && (
-          <button className="rounded bg-slate-900 px-3 py-1.5 text-sm text-white"
-            onClick={() => run(() => post(`/api/reports/${id}/submit`), 'Submitted')}>
+          <button
+            className="rounded bg-slate-900 px-3 py-1.5 text-sm text-white"
+            onClick={() => run(() => post(`/api/reports/${id}/submit`), 'Submitted')}
+          >
             Submit
           </button>
         )}
-
+        {isOwner && !report.archived_at && (isDraft || report.status === 'paid') && (
+          <button
+            className="rounded border px-3 py-1.5 text-sm"
+            onClick={() => run(() => post(`/api/reports/${id}/archive`), 'Archived')}
+          >
+            Archive
+          </button>
+        )}
+        {isOwner && report.archived_at && (
+          <button
+            className="rounded border px-3 py-1.5 text-sm"
+            onClick={() => run(() => post(`/api/reports/${id}/restore`), 'Restored')}
+          >
+            Restore
+          </button>
+        )}
         {canDecide && report.status === 'submitted' && (
           <>
-            <button className="rounded bg-emerald-700 px-3 py-1.5 text-sm text-white"
-              onClick={() => run(() => post(`/api/reports/${id}/approve`), 'Approved')}>
+            <button
+              className="rounded bg-emerald-700 px-3 py-1.5 text-sm text-white"
+              onClick={() => run(() => post(`/api/reports/${id}/approve`), 'Approved')}
+            >
               Approve
             </button>
-            <input className="rounded border px-2 py-1 text-sm" placeholder="Rejection reason"
-              value={rejectReason} onChange={(e) => setRejectReason(e.target.value)} />
-            <button className="rounded bg-red-700 px-3 py-1.5 text-sm text-white"
-              onClick={() => run(() => post(`/api/reports/${id}/reject`, { reason: rejectReason }), 'Rejected → draft')}>
+            <input
+              className="rounded border px-2 py-1 text-sm"
+              placeholder="Rejection reason"
+              value={rejectReason}
+              onChange={(e) => setRejectReason(e.target.value)}
+            />
+            <button
+              className="rounded bg-red-700 px-3 py-1.5 text-sm text-white"
+              onClick={() =>
+                run(() => post(`/api/reports/${id}/reject`, { reason: rejectReason }), 'Rejected → draft')
+              }
+            >
               Reject
             </button>
           </>
         )}
-
         {canDecide && report.status === 'approved' && (
-          <button className="rounded bg-blue-800 px-3 py-1.5 text-sm text-white"
-            onClick={() => run(() => post(`/api/reports/${id}/pay`), 'Marked paid')}>
+          <button
+            className="rounded bg-blue-800 px-3 py-1.5 text-sm text-white"
+            onClick={() => run(() => post(`/api/reports/${id}/pay`), 'Marked paid')}
+          >
             Mark paid
-          </button>
-        )}
-
-        {(report.status === 'draft' || report.status === 'paid') && !report.archived_at && (
-          <button className="rounded border px-3 py-1.5 text-sm" onClick={() => run(() => post(`/api/reports/${id}/archive`), 'Archived')}>
-            Archive
-          </button>
-        )}
-        {report.archived_at && (
-          <button className="rounded border px-3 py-1.5 text-sm" onClick={() => run(() => post(`/api/reports/${id}/restore`), 'Restored')}>
-            Restore
           </button>
         )}
       </div>
@@ -224,34 +249,123 @@ export function ReportDetailPage() {
             ))}
           </tbody>
         </table>
-
         {canEditDraft && (
           <form onSubmit={addLine} className="grid gap-2 sm:grid-cols-5">
-            <input type="date" className="rounded border px-2 py-1" value={line.spent_on} onChange={(e) => setLine({ ...line, spent_on: e.target.value })} required />
-            <select className="rounded border px-2 py-1" value={line.category} onChange={(e) => setLine({ ...line, category: e.target.value })}>
-              {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            <input
+              type="date"
+              className="rounded border px-2 py-1"
+              value={line.spent_on}
+              onChange={(e) => setLine({ ...line, spent_on: e.target.value })}
+              required
+            />
+            <select
+              className="rounded border px-2 py-1"
+              value={line.category}
+              onChange={(e) => setLine({ ...line, category: e.target.value })}
+            >
+              {CATEGORIES.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
             </select>
-            <input className="rounded border px-2 py-1 sm:col-span-2" placeholder="Description" value={line.description} onChange={(e) => setLine({ ...line, description: e.target.value })} required />
-            <input className="rounded border px-2 py-1" placeholder="Amount (₹)" type="number" step="0.01" min="0" value={line.amount} onChange={(e) => setLine({ ...line, amount: e.target.value })} required />
+            <input
+              className="rounded border px-2 py-1 sm:col-span-2"
+              placeholder="Description"
+              value={line.description}
+              onChange={(e) => setLine({ ...line, description: e.target.value })}
+              required
+            />
+            <input
+              className="rounded border px-2 py-1"
+              placeholder="Amount (₹)"
+              type="number"
+              step="0.01"
+              min="0"
+              value={line.amount}
+              onChange={(e) => setLine({ ...line, amount: e.target.value })}
+              required
+            />
             <button className="rounded bg-slate-800 px-3 py-1 text-white sm:col-span-5 sm:w-fit">
               {editingLineId ? 'Save line' : 'Add line'}
             </button>
             {editingLineId && (
-              <button type="button" className="rounded border px-3 py-1 text-sm sm:w-fit" onClick={() => { setEditingLineId(null); setLine(emptyLine); }}>
+              <button
+                type="button"
+                className="rounded border px-3 py-1 text-sm sm:w-fit"
+                onClick={() => {
+                  setEditingLineId(null);
+                  setLine(emptyLine);
+                }}
+              >
                 Cancel edit
               </button>
             )}
           </form>
         )}
-
       </section>
+
+      {canEditDraft && (
+        <section className="rounded border border-slate-200 bg-white p-4">
+          <h2 className="mb-3 font-medium">Assigned approvers</h2>
+          <div className="mb-3 flex flex-wrap gap-3">
+            {approverOptions.map((a) => (
+              <label key={a.id} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={selectedApprovers.includes(a.id)}
+                  onChange={(e) => {
+                    setSelectedApprovers((prev) =>
+                      e.target.checked ? [...prev, a.id] : prev.filter((x) => x !== a.id),
+                    );
+                  }}
+                />
+                {a.name}
+              </label>
+            ))}
+          </div>
+          <button
+            className="rounded border px-3 py-1.5 text-sm"
+            onClick={() =>
+              run(async () => {
+                const currentIds = report.approvers.map((a) => a.id);
+
+                const toAdd = selectedApprovers.filter((approverId) => !currentIds.includes(approverId));
+                const toRemove = currentIds.filter((approverId) => !selectedApprovers.includes(approverId));
+
+                await Promise.all([
+                  ...toAdd.map((approverId) =>
+                    api(`/api/reports/${id}/approvers`, {
+                      method: 'POST',
+                      json: { approver_id: approverId },
+                    }),
+                  ),
+                  ...toRemove.map((approverId) =>
+                    api(`/api/reports/${id}/approvers/${approverId}`, {
+                      method: 'DELETE',
+                    }),
+                  ),
+                ]);
+              }, 'Approvers updated')
+            }
+          >
+            Save approvers
+          </button>
+        </section>
+      )}
+
+      {(!isDraft || report.archived_at) && report.approvers.length > 0 && (
+        <p className="text-sm text-slate-600">Approvers: {report.approvers.map((a) => a.name).join(', ')}</p>
+      )}
 
       <section className="rounded border border-slate-200 bg-white p-4">
         <h2 className="mb-3 font-medium">Timeline (immutable)</h2>
         <ul className="space-y-2 text-sm">
           {history.events.map((ev) => (
             <li key={`e-${ev.id}`} className="border-l-2 border-slate-300 pl-3">
-              <span className="font-medium">{ev.old_status || '—'} → {ev.new_status}</span>{' '}
+              <span className="font-medium">
+                {ev.old_status || '—'} → {ev.new_status}
+              </span>{' '}
               by {ev.actor_name} at {ev.created_at}
               {ev.reason && <div className="text-slate-600">Reason: {ev.reason}</div>}
             </li>
@@ -262,16 +376,23 @@ export function ReportDetailPage() {
             </li>
           ))}
         </ul>
-
-        <form className="mt-3 flex gap-2" onSubmit={(e) => {
-          e.preventDefault();
-          run(async () => {
-            await post(`/api/reports/${id}/comments`, { body: comment });
-            setComment('');
-          });
-        }}>
-          <input className="flex-1 rounded border px-2 py-1 text-sm" value={comment}
-            onChange={(e) => setComment(e.target.value)} placeholder="Add a comment" required />
+        <form
+          className="mt-3 flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            run(async () => {
+              await post(`/api/reports/${id}/comments`, { body: comment });
+              setComment('');
+            });
+          }}
+        >
+          <input
+            className="flex-1 rounded border px-2 py-1 text-sm"
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            placeholder="Add a comment"
+            required
+          />
           <button className="rounded bg-slate-800 px-3 py-1 text-sm text-white">Post</button>
         </form>
       </section>
