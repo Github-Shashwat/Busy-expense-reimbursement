@@ -4,11 +4,17 @@ import { requireAuth, requireApprover } from '../auth.js';
 
 export const dashboardRouter = Router();
 
-dashboardRouter.get('/', requireAuth, (_req, res) => {
+dashboardRouter.get('/', requireAuth, (req, res) => {
+  const isEmployee = req.user!.role === 'employee';
+  const ownerParams = isEmployee ? [req.user!.id] : [];
+  const reportScope = isEmployee ? ' AND r.owner_id = ?' : '';
+  const directReportScope = isEmployee ? ' AND owner_id = ?' : '';
+
   const awaitingApproval = (
     db.prepare(
-      `SELECT COUNT(*) AS c FROM expense_reports WHERE status = 'submitted' AND archived_at IS NULL`,
-    ).get() as { c: number }
+      `SELECT COUNT(*) AS c FROM expense_reports
+       WHERE status = 'submitted' AND archived_at IS NULL${directReportScope}`,
+    ).get(...ownerParams) as { c: number }
   ).c;
 
   const due = (
@@ -17,46 +23,50 @@ dashboardRouter.get('/', requireAuth, (_req, res) => {
         `SELECT COALESCE(SUM(el.amount_cents), 0) AS total
          FROM expense_reports r
          JOIN expense_lines el ON el.report_id = r.id
-         WHERE r.status = 'approved' AND r.archived_at IS NULL`,
+         WHERE r.status = 'approved' AND r.archived_at IS NULL${reportScope}`,
       )
-      .get() as { total: number }
+      .get(...ownerParams) as { total: number }
   ).total;
 
   const approvedThisWeek = (
     db
       .prepare(
-        `SELECT COUNT(*) AS c FROM status_events
-         WHERE new_status = 'approved' AND created_at >= datetime('now', '-7 days')`,
+        `SELECT COUNT(*) AS c FROM status_events se
+         JOIN expense_reports r ON r.id = se.report_id
+         WHERE se.new_status = 'approved'
+           AND se.created_at >= datetime('now', '-7 days')${reportScope}`,
       )
-      .get() as { c: number }
+      .get(...ownerParams) as { c: number }
   ).c;
 
   const paidThisWeek = (
     db
       .prepare(
-        `SELECT COUNT(*) AS c FROM status_events
-         WHERE new_status = 'paid' AND created_at >= datetime('now', '-7 days')`,
+        `SELECT COUNT(*) AS c FROM status_events se
+         JOIN expense_reports r ON r.id = se.report_id
+         WHERE se.new_status = 'paid'
+           AND se.created_at >= datetime('now', '-7 days')${reportScope}`,
       )
-      .get() as { c: number }
+      .get(...ownerParams) as { c: number }
   ).c;
 
   const byStatus = db
     .prepare(
       `SELECT status, COUNT(*) AS count FROM expense_reports
-       WHERE archived_at IS NULL GROUP BY status`,
+       WHERE archived_at IS NULL${directReportScope} GROUP BY status`,
     )
-    .all();
+    .all(...ownerParams);
 
   const byCategory = db
     .prepare(
       `SELECT el.category, COALESCE(SUM(el.amount_cents), 0) AS total_cents
        FROM expense_lines el
        JOIN expense_reports r ON r.id = el.report_id
-       WHERE r.archived_at IS NULL
+       WHERE r.archived_at IS NULL${reportScope}
        GROUP BY el.category
        ORDER BY total_cents DESC`,
     )
-    .all();
+    .all(...ownerParams);
 
   const paidRows = db
     .prepare(
@@ -66,10 +76,10 @@ dashboardRouter.get('/', requireAuth, (_req, res) => {
        JOIN expense_reports r ON r.id = se.report_id
        JOIN expense_lines el ON el.report_id = r.id
        WHERE se.new_status = 'paid'
-         AND se.created_at >= datetime('now', '-56 days')
+         AND se.created_at >= datetime('now', '-56 days')${reportScope}
        GROUP BY week`,
     )
-    .all() as { week: string; total_cents: number }[];
+    .all(...ownerParams) as { week: string; total_cents: number }[];
 
   const byWeek = new Map(paidRows.map((r) => [r.week, r.total_cents]));
   const paidPerWeek: { week: string; total_cents: number }[] = [];
@@ -115,7 +125,7 @@ exportRouter.get('/reimbursements-due.csv', requireAuth, requireApprover, (_req,
 
   const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
   const lines = [
-    'report_id,title,owner_name,owner_email,total_cents,total_dollars,approved_at',
+    'report_id,title,owner_name,owner_email,total_cents,total_rupees,approved_at',
     ...rows.map((r) =>
       [
         r.id,

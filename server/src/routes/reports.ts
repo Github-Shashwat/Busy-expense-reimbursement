@@ -973,6 +973,18 @@ reportsRouter.post('/:id/submit', requireAuth, (req, res) => {
   }
   if (report.total_cents <= 0) return res.status(400).json({ error: 'Add at least one expense line before submitting' });
 
+  const approverCount = (
+    db
+      .prepare(`SELECT COUNT(*) AS count FROM report_approvers WHERE report_id = ?`)
+      .get(report.id) as { count: number }
+  ).count;
+
+  if (approverCount === 0) {
+    return res.status(400).json({
+      error: 'Assign at least one approver before submitting',
+    });
+  }
+
   db.prepare(
     `UPDATE expense_reports SET status = 'submitted', submitted_at = datetime('now'), updated_at = datetime('now')
      WHERE id = ? AND status = 'draft'`,

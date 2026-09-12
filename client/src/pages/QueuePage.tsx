@@ -11,6 +11,12 @@ type Report = {
   submitted_at: string | null;
 };
 
+const inputClass =
+  'rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-slate-500 focus:ring-2 focus:ring-slate-200';
+
+const secondaryButtonClass =
+  'rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-slate-200 disabled:cursor-not-allowed disabled:opacity-45';
+
 export function QueuePage() {
   const [assignedOnly, setAssignedOnly] = useState(false);
   const [items, setItems] = useState<Report[]>([]);
@@ -94,16 +100,46 @@ export function QueuePage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-3">
+    <div className="space-y-7">
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold">Approver queue</h1>
-          <p className="text-sm text-slate-600">Submitted reports awaiting a decision.</p>
+          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+            Approvals
+          </p>
+          <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-950">
+            Approver queue
+          </h1>
+          <p className="mt-1 text-sm text-slate-500">
+            Review submitted reports, decide in bulk, and export approved reimbursements for payment.
+          </p>
         </div>
-        <div className="flex flex-wrap gap-3">
-          <label className="flex items-center gap-2 text-sm">
+      </div>
+
+      {error && (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+      {result && (
+        <pre className="whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+          {result}
+        </pre>
+      )}
+
+      <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+          <div>
+            <h2 className="font-semibold text-slate-900">Queue controls</h2>
+            <p className="mt-1 text-xs text-slate-500">
+              Filter your assigned decisions or act on selected submitted reports.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700">
             <input
               type="checkbox"
+              className="h-4 w-4 rounded border-slate-300"
               checked={assignedOnly}
               onChange={(e) => {
                 setPage(1);
@@ -111,91 +147,116 @@ export function QueuePage() {
               }}
             />
             Assigned to me only
+            </label>
+
+            <button className={secondaryButtonClass} onClick={exportCsv}>
+              Export reimbursements due (CSV)
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <button
+            disabled={!selected.length}
+            className="rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-800 focus:outline-none focus:ring-2 focus:ring-emerald-200 disabled:cursor-not-allowed disabled:opacity-45"
+            onClick={() => bulk('approve')}
+          >
+            Bulk approve ({selected.length})
+          </button>
+          <label className="sr-only" htmlFor="bulk-reject-reason">
+            Bulk reject reason
           </label>
-          <button className="rounded border px-3 py-1.5 text-sm" onClick={exportCsv}>
-            Export reimbursements due (CSV)
+          <input
+            id="bulk-reject-reason"
+            className={`${inputClass} w-64 max-w-full`}
+            placeholder="Reason for bulk rejection"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+          />
+          <button
+            disabled={!selected.length || !reason.trim()}
+            className="rounded-lg bg-red-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-200 disabled:cursor-not-allowed disabled:opacity-45"
+            onClick={() => bulk('reject')}
+          >
+            Bulk reject
           </button>
         </div>
-      </div>
+      </section>
 
-      {error && <p className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
-      {result && <pre className="whitespace-pre-wrap rounded bg-slate-100 px-3 py-2 text-sm">{result}</pre>}
+      <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+          <div>
+            <h2 className="font-semibold text-slate-900">Submitted reports</h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              {total} submitted / page {page} of {pages}
+            </p>
+          </div>
+        </div>
 
-      <div className="flex flex-wrap gap-2">
-        <button
-          disabled={!selected.length}
-          className="rounded bg-emerald-700 px-3 py-1.5 text-sm text-white disabled:opacity-40"
-          onClick={() => bulk('approve')}
-        >
-          Bulk approve ({selected.length})
-        </button>
-        <input
-          className="rounded border px-2 py-1 text-sm"
-          placeholder="Bulk reject reason"
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-        />
-        <button
-          disabled={!selected.length || !reason.trim()}
-          className="rounded bg-red-700 px-3 py-1.5 text-sm text-white disabled:opacity-40"
-          onClick={() => bulk('reject')}
-        >
-          Bulk reject
-        </button>
-      </div>
-
-      <p className="text-sm text-slate-600">
-        {total} submitted · page {page} of {pages}
-      </p>
-
-      <div className="overflow-x-auto rounded border border-slate-200 bg-white">
-        <table className="w-full text-left text-sm">
-          <thead className="border-b bg-slate-50">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-left text-sm">
+          <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
             <tr>
-              <th className="px-3 py-2" />
-              <th className="px-3 py-2">Title</th>
-              <th className="px-3 py-2">Owner</th>
-              <th className="px-3 py-2">Submitted</th>
-              <th className="px-3 py-2">Total</th>
+              <th className="w-12 px-5 py-3" />
+              <th className="px-5 py-3">Title</th>
+              <th className="px-5 py-3">Owner</th>
+              <th className="px-5 py-3">Submitted</th>
+              <th className="px-5 py-3 text-right">Total</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className="divide-y divide-slate-100">
             {items.map((r) => (
-              <tr key={r.id} className="border-b">
-                <td className="px-3 py-2">
-                  <input type="checkbox" checked={selected.includes(r.id)} onChange={() => toggle(r.id)} />
+              <tr key={r.id} className="transition-colors hover:bg-slate-50/70">
+                <td className="px-5 py-4 align-middle">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 rounded border-slate-300"
+                    checked={selected.includes(r.id)}
+                    onChange={() => toggle(r.id)}
+                  />
                 </td>
-                <td className="px-3 py-2">
-                  <Link className="text-blue-700 hover:underline" to={`/reports/${r.id}`}>
+                <td className="px-5 py-4">
+                  <Link
+                    className="font-medium text-slate-900 transition hover:text-blue-700"
+                    to={`/reports/${r.id}`}
+                    state={{ from: '/queue' }}
+                  >
                     {r.title}
                   </Link>
+                  <div className="mt-0.5 text-xs text-slate-400">Report #{r.id}</div>
                 </td>
-                <td className="px-3 py-2">{r.owner_name}</td>
-                <td className="px-3 py-2">{r.submitted_at}</td>
-                <td className="px-3 py-2">{money(r.total_cents)}</td>
+                <td className="px-5 py-4 text-slate-600">{r.owner_name}</td>
+                <td className="whitespace-nowrap px-5 py-4 text-slate-600">{r.submitted_at}</td>
+                <td className="whitespace-nowrap px-5 py-4 text-right font-semibold text-slate-900">
+                  {money(r.total_cents)}
+                </td>
               </tr>
             ))}
             {items.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-3 py-6 text-center text-slate-500">
-                  Queue empty
+                <td colSpan={5} className="px-5 py-12 text-center">
+                  <div className="text-sm font-medium text-slate-700">Queue empty</div>
+                  <p className="mt-1 text-xs text-slate-400">
+                    No submitted reports are waiting in this view.
+                  </p>
                 </td>
               </tr>
             )}
           </tbody>
         </table>
-      </div>
+        </div>
+      </section>
 
       <div className="flex gap-2">
         <button
-          className="rounded border px-3 py-1 text-sm disabled:opacity-40"
+          className={secondaryButtonClass}
           disabled={page <= 1}
           onClick={() => setPage((p) => p - 1)}
         >
           Previous
         </button>
         <button
-          className="rounded border px-3 py-1 text-sm disabled:opacity-40"
+          className={secondaryButtonClass}
           disabled={page >= pages}
           onClick={() => setPage((p) => p + 1)}
         >
