@@ -568,6 +568,148 @@ reportsRouter.get('/:id/approvers', requireAuth, (req, res) => {
   res.json({ approvers: getApprovers(report.id) });
 });
 
+
+reportsRouter.post('/bulk-decide', requireAuth, requireApprover, (req, res) => {
+  const body = z
+    .object({
+      reportIds: z.array(z.number().int().positive()).min(1).max(100),
+      action: z.enum(['approve', 'reject']),
+      reason: z.string().trim().optional(),
+    })
+    .safeParse(req.body);
+
+  if (!body.success) {
+    return res.status(400).json({
+      error: 'Invalid bulk decision request',
+    });
+  }
+
+  const { reportIds, action, reason } = body.data;
+
+  if (action === 'reject' && !reason) {
+    return res.status(400).json({
+      error: 'Rejection reason is required',
+    });
+  }
+
+  const results = reportIds.map((reportId) => {
+    const result = decide(
+      reportId,
+      req.user!.id,
+      action,
+      reason,
+    );
+
+    return {
+      reportId,
+      ok: result.ok,
+      ...(result.ok ? {} : { error: result.error }),
+    };
+  });
+
+  const succeeded = results.filter((result) => result.ok).length;
+  const failed = results.length - succeeded;
+
+  return res.json({
+    action,
+    results,
+    succeeded,
+    failed,
+  });
+});
+
+
+reportsRouter.get('/payment-export', requireAuth, requireApprover, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT
+         expense_reports.id,
+         expense_reports.title,
+         expense_reports.period_start,
+         expense_reports.period_end,
+         users.name AS owner_name,
+         users.email AS owner_email,
+         ${TOTAL_SQL} AS total_cents,
+         expense_reports.status,
+         expense_reports.submitted_at,
+         expense_reports.updated_at
+       FROM expense_reports
+       JOIN users
+         ON users.id = expense_reports.owner_id
+       WHERE expense_reports.status = 'approved'
+         AND expense_reports.archived_at IS NULL
+       ORDER BY expense_reports.updated_at DESC,
+                expense_reports.id DESC`,
+    )
+    .all() as Array<{
+      id: number;
+      title: string;
+      period_start: string;
+      period_end: string;
+      owner_name: string;
+      owner_email: string;
+      total_cents: number;
+      status: string;
+      submitted_at: string | null;
+      updated_at: string;
+    }>;
+
+  const escapeCsv = (value: unknown) => {
+    const text = String(value ?? '');
+
+    if (
+      text.includes(',') ||
+      text.includes('"') ||
+      text.includes('\n') ||
+      text.includes('\r')
+    ) {
+      return `"${text.replace(/"/g, '""')}"`;
+    }
+
+    return text;
+  };
+
+  const header = [
+    'report_id',
+    'title',
+    'period_start',
+    'period_end',
+    'owner_name',
+    'owner_email',
+    'total_cents',
+    'status',
+    'submitted_at',
+    'updated_at',
+  ];
+
+  const csvRows = rows.map((row) => [
+    row.id,
+    row.title,
+    row.period_start,
+    row.period_end,
+    row.owner_name,
+    row.owner_email,
+    row.total_cents,
+    row.status,
+    row.submitted_at,
+    row.updated_at,
+  ]);
+
+  const csv = [header, ...csvRows]
+    .map((row) => row.map(escapeCsv).join(','))
+    .join('\r\n');
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+
+  res.setHeader(
+    'Content-Disposition',
+    'attachment; filename="approved-awaiting-payment.csv"',
+  );
+
+  return res.send(csv);
+});
+
+
 reportsRouter.post('/:id/approvers', requireAuth, (req, res) => {
   const report = getReport(Number(req.params.id));
 
