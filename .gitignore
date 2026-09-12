@@ -13,3 +13,6 @@ server/data/
 .vercel
 .idea/
 .vscode/
+.git-history-backup/
+
+/.git-history-backup/
