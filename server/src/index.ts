@@ -7,12 +7,6 @@ import { authRouter } from './routes/auth.js';
 import { reportsRouter } from './routes/reports.js';
 import { dashboardRouter, exportRouter, alertsRouter } from './routes/misc.js';
 
-migrate();
-
-if (seedDemoData(false)) {
-  console.log('Empty database — loaded demo seed data');
-}
-
 const app = express();
 const origin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
 
@@ -38,6 +32,19 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 
 const port = Number(process.env.PORT || 4000);
 
-app.listen(port, () => {
-  console.log(`API listening on http://localhost:${port}`);
+async function start() {
+  await migrate();
+
+  if (await seedDemoData(false)) {
+    console.log('Empty database — loaded demo seed data');
+  }
+
+  app.listen(port, () => {
+    console.log(`API listening on http://localhost:${port}`);
+  });
+}
+
+start().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
