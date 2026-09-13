@@ -2,9 +2,9 @@
 
 ## Links
 
-- **GitHub repository:** [<public repo URL>](https://github.com/Github-Shashwat/Busy-expense-reimbursement)
-- **Live application:** [<deployed URL>](https://busy-expense-reimbursement.vercel.app)
-- **API:** [<deployed URL>](https://expense-reimbursement-api.onrender.com)
+- **GitHub repository:** https://github.com/Github-Shashwat/Busy-expense-reimbursement
+- **Live application:** https://busy-expense-reimbursement.vercel.app
+- **API:** https://expense-reimbursement-api.onrender.com
 
 ## Notes for the reviewer
 
