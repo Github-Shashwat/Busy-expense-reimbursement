@@ -1,10 +1,10 @@
 # Decisions
 
-## Decision 1 — SQLite implementation
+## Decision 1 — Database implementation
 
-- **Chose:** Node.js built-in `node:sqlite` (`DatabaseSync`)
-- **Rejected:** `better-sqlite3`
-- **Why:** `better-sqlite3` failed to compile on Node 25 in this environment. Node's built-in SQLite support avoids the native addon while keeping the database synchronous and simple enough for the take-home application.
+- **Chose:** PostgreSQL using the `pg` package
+- **Previously used:** Node.js built-in `node:sqlite` (`DatabaseSync`)
+- **Why:** SQLite was useful during the initial take-home build, especially after `better-sqlite3` failed to compile on Node 25. The final deployed application uses PostgreSQL so the production API runs against managed database infrastructure rather than a local SQLite file.
 
 ## Decision 2 — Authentication
 

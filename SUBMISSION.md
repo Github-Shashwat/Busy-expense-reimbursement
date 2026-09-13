@@ -2,17 +2,19 @@
 
 ## Links
 
-- **GitHub repository:** https://github.com/Github-Shashwat/Busy-expense-reimbursement 
-**Live application:** <deployed URL>
+- **GitHub repository:** [<public repo URL>](https://github.com/Github-Shashwat/Busy-expense-reimbursement)
+- **Live application:** [<deployed URL>](https://busy-expense-reimbursement.vercel.app)
+- **API:** [<deployed URL>](https://expense-reimbursement-api.onrender.com)
 
 ## Notes for the reviewer
 
 - The application can be run locally using the `server` + `client` setup described in `GETTING_STARTED.md`.
-- Requires **Node.js 22+** because the application uses Node's built-in `node:sqlite`.
+- Requires **Node.js 22+**.
 - Demo data is automatically seeded when the database is empty.
-- To reset the demo data, run `cd server && npm run seed`.
+- To reset the **local** demo data, run `cd server && npm run seed`.
+- The production stack is Vercel for the frontend, Render Web Service for the API, and Render PostgreSQL for persistence.
 - If deployed on Render's free tier, the API may sleep when idle; the first request after inactivity may take longer.
-- SQLite is stored on the Render persistent disk in production.
+- The current Render PostgreSQL database is on a free plan with a limited lifetime, so it should not be treated as permanent production infrastructure.
 
 ## Demo credentials
 
@@ -29,8 +31,8 @@
 |-------|---------------|-----|
 | Frontend | React + Vite + TypeScript + Tailwind + React Router | Fast SPA with a simple, maintainable UI |
 | Backend | Node.js + Express + TypeScript | Straightforward REST API |
-| Database | SQLite via `node:sqlite` | File-based and requires no separate database server |
-| Hosting | Render (API) + Vercel (UI) | Simple free-tier deployment matching the assignment |
+| Database | PostgreSQL via `pg` | Managed relational database |
+| Hosting | Render (API + PostgreSQL) + Vercel (UI) | Simple hosted deployment matching the assignment |
 
 ## Goal checklist
 
@@ -59,8 +61,8 @@ About **12 hours** across planning, implementation, documentation, and review.
 
 ## What would you do next, with another 12 hours?
 
-I would expand automated API coverage for lifecycle and authorization edge cases, improve production database scalability with PostgreSQL if needed, and add receipt file uploads with appropriate storage and access controls.
+I would expand automated API coverage for lifecycle and authorization edge cases, add receipt file uploads with appropriate storage and access controls, and harden production operations around backups, monitoring, and database lifecycle.
 
 ## What are you least happy with in this codebase, and why?
 
-The dashboard and report-list queries are intentionally straightforward rather than heavily optimized. They are appropriate for the scale of this take-home, but at larger data volumes I would add targeted indexes and full-text search where useful, and consider PostgreSQL for higher concurrent workloads.
+The dashboard and report-list queries are intentionally straightforward rather than heavily optimized. They are appropriate for the scale of this take-home, but at larger data volumes I would add targeted indexes, full-text search where useful, and deeper query analysis.

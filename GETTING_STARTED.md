@@ -4,16 +4,21 @@ Expense reimbursement application for BUSY Infotech Assignment 11.
 
 ## Requirements
 
-- **Node.js 22+** (uses built-in `node:sqlite`)
+- **Node.js 22+**
 - npm
+- Docker, or another local PostgreSQL database
 
 ## Run locally
+
+The local API uses PostgreSQL through `DATABASE_URL`. `DATABASE_PATH` is no longer used.
+
+If you are using Docker, start a local PostgreSQL database on port `5432` before starting the API. Use your own local password and database name; do not reuse production credentials.
 
 ### 1. Start the API
 
 ```bash
 cd server
-cp .env.example .env
+Copy-Item .env.example .env
 npm install
 npm run dev
 
@@ -22,6 +27,17 @@ npm run dev
 The API runs at `http://localhost:4000`.
 
 On a fresh database, the server creates the schema and seeds the demo data automatically.
+
+The server `.env` file must include:
+
+```text
+DATABASE_URL=postgres://<local-user>:<local-password>@localhost:5432/<local-database>
+JWT_SECRET=<local-dev-secret>
+CLIENT_ORIGIN=http://localhost:5173
+STALE_DAYS=7
+REDISMISS_DAYS=3
+
+```
 
 ### 2. Start the UI
 
@@ -35,6 +51,8 @@ npm run dev
 ```
 
 The UI runs at `http://localhost:5173`.
+
+The local client does not require a `.env` file. Vite proxies local `/api` requests to `http://localhost:4000`, so the browser can call the API without a local `VITE_API_URL`.
 
 Open `http://localhost:5173` and sign in with one of the demo accounts below.
 
@@ -72,50 +90,45 @@ The following flows cover the main assignment requirements.
 
 ## Deploy (free tier)
 
-### 1. API on Render
+### 1. Database on Render
+
+Create a Render PostgreSQL database. Copy its internal database URL for the API service's `DATABASE_URL` value.
+
+The current demo deployment uses a free Render PostgreSQL database, which has a limited lifetime. For a longer-lived production deployment, move to a persistent paid database plan.
+
+### 2. API on Render
 
 Create a Render Web Service using the `server/` directory.
 
-* **Build command:** `npm install && npm run build`
+* **Build command:** `npm ci && npm run build`
 * **Start command:** `npm start`
 
 Set the following environment variables:
 
 ```text
 JWT_SECRET=<strong-secret>
-DATABASE_PATH=/data/app.db
-CLIENT_ORIGIN=<vercel-url>
+DATABASE_URL=<render-postgresql-internal-url>
+CLIENT_ORIGIN=https://busy-expense-reimbursement.vercel.app
 STALE_DAYS=7
 REDISMISS_DAYS=3
 
 ```
 
-Attach a persistent disk and mount it at:
-
-```text
-/data
-
-```
-
-The persistent disk is required because the SQLite database is stored at `/data/app.db`.
-
-### 2. UI on Vercel
+### 3. UI on Vercel
 
 Deploy the `client/` directory as the project root.
 
 Set:
 
 ```text
-VITE_API_URL=https://<render-url>
+VITE_API_URL=https://expense-reimbursement-api.onrender.com
 
 ```
 
 The frontend then sends API requests to the deployed Render service.
 
-### 3. Submission
+### 4. Submission
 
 Add the deployed frontend and API URLs to `SUBMISSION.md`.
 
 The Render free tier may sleep when idle, so the first request after a period of inactivity may take longer while the service wakes up.
-
-

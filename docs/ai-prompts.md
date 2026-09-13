@@ -1,6 +1,6 @@
 # AI Prompts
 
-AI (Cursor) was used selectively as a development aid during the project, primarily for scaffolding, debugging, implementation review, and documentation. The prompts below show representative examples of how AI was used during development and how incorrect or unsuitable suggestions were identified and corrected.
+AI (Codex/Cursor) was used selectively as a development aid during the project, including for scaffolding, debugging, implementation review, documentation, and the SQLite-to-PostgreSQL migration. The developer reviewed and verified the resulting changes through builds, tests, fresh database initialization, API regression checks, and production smoke testing. The prompts below show representative examples of how AI was used during development and how incorrect or unsuitable suggestions were identified and corrected.
 
 ## Assignment intake and planning
 
@@ -59,6 +59,32 @@ The implementation was switched to Node's built-in `node:sqlite` (`DatabaseSync`
 
 The Node engine requirement and database setup were updated accordingly, and the main authentication, report, approval, bulk-action, alert, and pagination flows were re-tested.
 
+## SQLite-to-PostgreSQL migration
+
+### Prompt
+
+Inspect the existing SQLite implementation and produce a staged migration plan to PostgreSQL using `pg`, without introducing an ORM or changing the Express API, business logic, authorization rules, dashboard behavior, alerts, CSV export, or frontend contracts.
+
+### What came back
+
+A staged plan covering PostgreSQL connection infrastructure, schema and seed migration, route-by-route conversion, compatibility cleanup, and full regression verification.
+
+### What was refined
+
+The migration was done in small stages and verified after each stage:
+
+- PostgreSQL connection infrastructure using `pg.Pool` and `DATABASE_URL`;
+- PostgreSQL schema and demo seed migration with `INSERT ... RETURNING`;
+- authentication route migration;
+- report route migration, including lifecycle transactions and server-computed totals;
+- dashboard, export, and alert route migration, including role-scoped metrics and stale-alert date arithmetic;
+- removal of the temporary SQLite compatibility layer;
+- fresh database initialization, seed verification, API regression checks, and production smoke testing.
+
+### Incorrect result / correction
+
+One migration review initially risked treating PostgreSQL week formatting as interchangeable with SQLite `strftime('%Y-W%W')`. That was corrected by preserving the historical SQLite-style week label semantics for the dashboard's 8-week chart while still using PostgreSQL for the underlying paid-report aggregation.
+
 ## Implementation review and refinement
 
 ### Prompt
@@ -88,7 +114,7 @@ The final implementation was checked to ensure that:
 
 ### Prompt
 
-Finish the project documentation based on the implemented application. Document the architecture, schema, decisions, build plan, AI usage, local setup, and an incremental Git commit guide for a colleague. Do not create a GitHub repository.
+Finish the project documentation based on the implemented application. Document the architecture, schema, decisions, build plan, AI usage, local setup, and handoff notes for a colleague. Do not create a GitHub repository.
 
 ### What came back
 
@@ -100,7 +126,6 @@ The documentation set was completed, including:
 - `docs/schema.md`
 - `docs/decisions.md`
 - `docs/ai-prompts.md`
-- `docs/COMMIT_GUIDE.md`
 - `SUBMISSION.md`
 
 ### What was refined

@@ -4,7 +4,7 @@
 
 | Session | Goal | Built |
 |---------|------|-------|
-| 1 | Accounts/roles | Monorepo, SQLite schema/migration, JWT login, seeded employee/approver users |
+| 1 | Accounts/roles | Monorepo, database schema/migration, JWT login, seeded employee/approver users |
 | 2 | Reports + lines | Report CRUD, line-item CRUD, archive/restore, server-computed SQL totals |
 | 3 | Lifecycle + history | Draft → Submitted → Approved/Paid flow, rejection back to Draft, self-approval block, immutable status history, comments |
 | 4 | Approvers + queue | Many-to-many approver assignments, assigned approval queue, server-side authorization |
@@ -40,12 +40,12 @@ Alerts depend on submitted reports, approver assignments, and elapsed time, so t
 | Approvers/search/bulk/dashboard/alerts | 4h | ~3.5h |
 | Frontend polish + docs + review | 2h | ~2h |
 
-Switched from `better-sqlite3` to Node's built-in `node:sqlite` after the native dependency failed to build on Node 25. This removed the native build issue while keeping SQLite and the overall architecture simple.
+The initial implementation switched from `better-sqlite3` to Node's built-in `node:sqlite` after the native dependency failed to build on Node 25. The final deployment was then migrated in stages from SQLite to PostgreSQL while preserving the same Express API contracts and business rules.
 
 ## What we cut
 
 - Stretch ideas such as OCR and multi-currency support
-- ORM; the application uses SQLite directly
+- ORM; the application uses SQL through a small `pg` connection layer
 - A large automated test suite; validation was performed through targeted manual/API smoke checks
 - Advanced UI features beyond what was needed for the reimbursement workflow
 - Automated GitHub/deployment work from this workspace

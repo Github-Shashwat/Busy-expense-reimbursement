@@ -6,7 +6,7 @@
 
 2. **API (Express + TypeScript)** — HTTP JSON API in `server/`. Handles authentication, authorization, report/line CRUD, lifecycle transitions, approver assignments, search/filtering/pagination, bulk decisions, dashboard aggregates, stale alerts, and payment CSV export.
 
-3. **SQLite database** — single SQLite file accessed through Node's built-in `node:sqlite` (`DatabaseSync`). The schema is created on startup and demo data is seeded when the `users` table is empty.
+3. **PostgreSQL database** — relational database accessed through `pg.Pool`. The schema is created on startup and demo data is seeded when the `users` table is empty.
 
 ```text
 Browser
@@ -17,8 +17,8 @@ Express API
    │
    │ SQL
    ▼
-SQLite file
-````
+PostgreSQL
+```
 
 ## Where each piece runs
 
@@ -26,9 +26,9 @@ SQLite file
 | ----------- | --------------------------------- | ----------------------------------------------------- |
 | React UI    | Vite on `:5173` with `/api` proxy | Vercel static build; `VITE_API_URL` points to the API |
 | Express API | `tsx` on `:4000`                  | Render Web Service                                    |
-| SQLite      | `server/data/app.db`              | Render persistent disk, e.g. `/data/app.db`           |
+| PostgreSQL  | Docker or local PostgreSQL on `:5432` | Render PostgreSQL                                  |
 
-The production deployment is intentionally small: Vercel serves the frontend, Render runs the API, and the SQLite database lives on Render's persistent disk.
+The production deployment is intentionally small: Vercel serves the frontend, Render runs the API, and Render PostgreSQL provides persistence. The current demo database is on Render's free plan, which has a limited lifetime.
 
 ## Authorization model
 

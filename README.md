@@ -25,15 +25,18 @@ A full-stack expense reimbursement application built for the BUSY Infotech take-
 - React + TypeScript + Vite
 - Tailwind CSS + React Router
 - Node.js + Express + TypeScript
-- SQLite using Node's built-in `node:sqlite`
+- PostgreSQL using `pg`
 - Vercel for the frontend
-- Render for the API
+- Render for the API and PostgreSQL database
 
 ## Local Development
 
 See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for setup and deployment instructions.
 
 The application requires Node.js 22+.
+
+Live application: https://busy-expense-reimbursement.vercel.app
+API: https://expense-reimbursement-api.onrender.com
 
 ## Demo Accounts
 
@@ -59,7 +62,7 @@ The application requires Node.js 22+.
 The frontend and API are deployed separately:
 
 - Frontend: Vercel
-- API: Render
-- Production SQLite: Render persistent disk
+- API: Render Web Service
+- Database: Render PostgreSQL
 
 Production configuration is documented in [`GETTING_STARTED.md`](./GETTING_STARTED.md).
