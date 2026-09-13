@@ -78,19 +78,6 @@ export async function migrate() {
   `);
 }
 
-export const db: any = {
-  prepare() {
-    throw new Error('SQLite route queries have not been migrated to PostgreSQL yet');
-  },
-  exec() {
-    throw new Error('SQLite route queries have not been migrated to PostgreSQL yet');
-  },
-};
-
-export function withTransaction() {
-  throw new Error('SQLite transactions have not been migrated to PostgreSQL yet');
-}
-
 export const CATEGORIES = ['travel', 'meals', 'supplies', 'lodging', 'other'] as const;
 export type Role = 'employee' | 'approver';
 export type Status = 'draft' | 'submitted' | 'approved' | 'rejected' | 'paid';
