@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { db, CATEGORIES, withTransaction, type Status } from '../db.js';
 import { requireAuth, requireApprover } from '../auth.js';
+import { getExpenseLinePolicyWarning } from '../policy.js';
 
 export const reportsRouter = Router();
 
@@ -19,6 +20,16 @@ type ReportRow = {
   total_cents: number;
   owner_name: string;
   owner_email: string;
+};
+
+type ExpenseLineRow = {
+  id: number;
+  report_id: number;
+  spent_on: string;
+  amount_cents: number;
+  category: string;
+  description: string;
+  created_at: string;
 };
 
 const TOTAL_SQL = `(SELECT COALESCE(SUM(amount_cents), 0) FROM expense_lines WHERE report_id = expense_reports.id)`;
@@ -74,6 +85,12 @@ function addStatusEvent(
   ).run(reportId, oldStatus, newStatus, actorId, reason ?? null);
 }
 
+function serializeLine(line: ExpenseLineRow) {
+  return {
+    ...line,
+    policy_warning: getExpenseLinePolicyWarning(line),
+  };
+}
 
 
 function canView(report: ReportRow, userId: number, role: string) {
@@ -173,13 +190,13 @@ function serializeReport(id: number) {
        WHERE report_id = ?
        ORDER BY spent_on, id`,
     )
-    .all(id);
+    .all(id) as ExpenseLineRow[];
 
   const approvers = getApprovers(id);
 
   return {
     ...report,
-    lines,
+    lines: lines.map(serializeLine),
     approvers,
   };
 }
@@ -914,8 +931,8 @@ reportsRouter.post('/:id/lines', requireAuth, (req, res) => {
     .run(report.id, body.data.spent_on, body.data.amount_cents, body.data.category, body.data.description);
 
   touchReport(report.id);
-  const line = db.prepare(`SELECT * FROM expense_lines WHERE id = ?`).get(info.lastInsertRowid);
-  res.status(201).json({ line, total_cents: getReport(report.id)!.total_cents });
+  const line = db.prepare(`SELECT * FROM expense_lines WHERE id = ?`).get(info.lastInsertRowid) as ExpenseLineRow;
+  res.status(201).json({ line: serializeLine(line), total_cents: getReport(report.id)!.total_cents });
 });
 
 reportsRouter.patch('/:id/lines/:lineId', requireAuth, (req, res) => {
@@ -946,8 +963,8 @@ reportsRouter.patch('/:id/lines/:lineId', requireAuth, (req, res) => {
   );
 
   touchReport(report.id);
-  const updated = db.prepare(`SELECT * FROM expense_lines WHERE id = ?`).get(line.id);
-  res.json({ line: updated, total_cents: getReport(report.id)!.total_cents });
+  const updated = db.prepare(`SELECT * FROM expense_lines WHERE id = ?`).get(line.id) as ExpenseLineRow;
+  res.json({ line: serializeLine(updated), total_cents: getReport(report.id)!.total_cents });
 });
 
 reportsRouter.delete('/:id/lines/:lineId', requireAuth, (req, res) => {

@@ -9,6 +9,11 @@ type Line = {
   amount_cents: number;
   category: string;
   description: string;
+  policy_warning: {
+    category: string;
+    limit_cents: number;
+    message: string;
+  } | null;
 };
 
 type Report = {
@@ -454,6 +459,11 @@ export function ReportDetailPage() {
                     <span className="line-clamp-2">
                       {expense.description}
                     </span>
+                    {expense.policy_warning && (
+                      <span className="mt-2 block text-xs font-medium text-amber-700">
+                        {expense.policy_warning.message}
+                      </span>
+                    )}
                   </td>
 
                   <td className="whitespace-nowrap px-5 py-4 text-right font-semibold text-slate-900">
