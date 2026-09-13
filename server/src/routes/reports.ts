@@ -1,10 +1,19 @@
-import { Router, type Request, type Response } from 'express';
+import { Router, type Request, type Response, type NextFunction } from 'express';
 import { z } from 'zod';
-import { db, CATEGORIES, withTransaction, type Status } from '../db.js';
+import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
+import { CATEGORIES, type Status } from '../db.js';
 import { requireAuth, requireApprover } from '../auth.js';
 import { getExpenseLinePolicyWarning } from '../policy.js';
+import { pgPool, query, withPgTransaction } from '../postgres.js';
 
 export const reportsRouter = Router();
+
+type Queryable = {
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values?: unknown[],
+  ): Promise<QueryResult<T>>;
+};
 
 type ReportRow = {
   id: number;
@@ -32,57 +41,102 @@ type ExpenseLineRow = {
   created_at: string;
 };
 
-const TOTAL_SQL = `(SELECT COALESCE(SUM(amount_cents), 0) FROM expense_lines WHERE report_id = expense_reports.id)`;
+type DecisionResult = { ok: true } | { ok: false; error: string; code?: string };
 
-function getReport(id: number): ReportRow | undefined {
-  return db
-    .prepare(
-      `SELECT expense_reports.*, ${TOTAL_SQL} AS total_cents,
-              users.name AS owner_name, users.email AS owner_email
-       FROM expense_reports
-       JOIN users ON users.id = expense_reports.owner_id
-       WHERE expense_reports.id = ?`,
-    )
-    .get(id) as ReportRow | undefined;
-}
-function getApprovers(reportId: number) {
-  return db
-    .prepare(
-      `SELECT u.id, u.name, u.email
-       FROM report_approvers ra
-       JOIN users u ON u.id = ra.approver_id
-       WHERE ra.report_id = ?
-       ORDER BY u.name, u.id`,
-    )
-    .all(reportId);
-}
+const REPORT_COLUMNS = `
+  expense_reports.id,
+  expense_reports.owner_id,
+  expense_reports.title,
+  expense_reports.period_start,
+  expense_reports.period_end,
+  expense_reports.status,
+  to_char(expense_reports.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS submitted_at,
+  to_char(expense_reports.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS archived_at,
+  to_char(expense_reports.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+  to_char(expense_reports.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+`;
 
-function isAssignedApprover(reportId: number, approverId: number) {
-  const row = db
-    .prepare(
-      `SELECT 1
-       FROM report_approvers
-       WHERE report_id = ? AND approver_id = ?`,
-    )
-    .get(reportId, approverId);
+const TOTAL_SQL = `(SELECT COALESCE(SUM(amount_cents), 0)::int FROM expense_lines WHERE report_id = expense_reports.id)`;
 
-  return Boolean(row);
-}
-function touchReport(id: number) {
-  db.prepare(`UPDATE expense_reports SET updated_at = datetime('now') WHERE id = ?`).run(id);
+const LINE_COLUMNS = `
+  id,
+  report_id,
+  spent_on,
+  amount_cents,
+  category,
+  description,
+  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at
+`;
+
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>,
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
-function addStatusEvent(
+function nextParam(params: unknown[], value: unknown) {
+  params.push(value);
+  return `$${params.length}`;
+}
+
+async function getReport(id: number, db: Queryable = pgPool): Promise<ReportRow | undefined> {
+  const result = await db.query<ReportRow>(
+    `SELECT ${REPORT_COLUMNS},
+            ${TOTAL_SQL} AS total_cents,
+            users.name AS owner_name,
+            users.email AS owner_email
+     FROM expense_reports
+     JOIN users ON users.id = expense_reports.owner_id
+     WHERE expense_reports.id = $1`,
+    [id],
+  );
+
+  return result.rows[0];
+}
+
+async function getApprovers(reportId: number, db: Queryable = pgPool) {
+  const result = await db.query(
+    `SELECT u.id, u.name, u.email
+     FROM report_approvers ra
+     JOIN users u ON u.id = ra.approver_id
+     WHERE ra.report_id = $1
+     ORDER BY u.name, u.id`,
+    [reportId],
+  );
+
+  return result.rows;
+}
+
+async function isAssignedApprover(reportId: number, approverId: number, db: Queryable = pgPool) {
+  const result = await db.query(
+    `SELECT 1
+     FROM report_approvers
+     WHERE report_id = $1 AND approver_id = $2`,
+    [reportId, approverId],
+  );
+
+  return (result.rowCount ?? 0) > 0;
+}
+
+async function touchReport(id: number, db: Queryable = pgPool) {
+  await db.query(`UPDATE expense_reports SET updated_at = now() WHERE id = $1`, [id]);
+}
+
+async function addStatusEvent(
+  db: Queryable,
   reportId: number,
   oldStatus: string | null,
   newStatus: string,
   actorId: number,
   reason?: string | null,
 ) {
-  db.prepare(
+  await db.query(
     `INSERT INTO status_events (report_id, old_status, new_status, actor_id, reason)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(reportId, oldStatus, newStatus, actorId, reason ?? null);
+     VALUES ($1, $2, $3, $4, $5)`,
+    [reportId, oldStatus, newStatus, actorId, reason ?? null],
+  );
 }
 
 function serializeLine(line: ExpenseLineRow) {
@@ -92,85 +146,94 @@ function serializeLine(line: ExpenseLineRow) {
   };
 }
 
-
 function canView(report: ReportRow, userId: number, role: string) {
   if (report.owner_id === userId) return true;
   if (role !== 'approver') return false;
   return report.status === 'submitted' || report.status === 'approved' || report.status === 'paid';
 }
 
-function decide(reportId: number, actorId: number, action: 'approve' | 'reject' | 'pay', reason?: string): { ok: true } | { ok: false; error: string; code?: string } {
+async function decide(
+  reportId: number,
+  actorId: number,
+  action: 'approve' | 'reject' | 'pay',
+  reason?: string,
+): Promise<DecisionResult> {
   if (!Number.isFinite(reportId)) return { ok: false, code: 'not_found', error: 'Report not found' };
 
-  const report = getReport(reportId);
-  if (!report) return { ok: false, code: 'not_found', error: 'Report not found' };
-  if (report.archived_at) return { ok: false, error: 'Archived reports cannot be approved, rejected, or marked paid' };
-  if (report.owner_id === actorId) {
-    return { ok: false, code: 'self_owner', error: 'You cannot approve, reject, or mark paid a report you own. Another approver must decide.' };
-  }
-  if (!isAssignedApprover(report.id, actorId)) {
-  return {
-    ok: false,
-    code: 'not_assigned',
-    error: 'You are not assigned to this report. Only an assigned approver can decide it.',
-  };
+  return withPgTransaction(async (client) => {
+    const report = await getReport(reportId, client);
+    if (!report) return { ok: false, code: 'not_found', error: 'Report not found' };
+    if (report.archived_at) return { ok: false, error: 'Archived reports cannot be approved, rejected, or marked paid' };
+    if (report.owner_id === actorId) {
+      return { ok: false, code: 'self_owner', error: 'You cannot approve, reject, or mark paid a report you own. Another approver must decide.' };
+    }
+    if (!(await isAssignedApprover(report.id, actorId, client))) {
+      return {
+        ok: false,
+        code: 'not_assigned',
+        error: 'You are not assigned to this report. Only an assigned approver can decide it.',
+      };
+    }
+
+    if (action === 'approve') {
+      if (report.status !== 'submitted') {
+        return { ok: false, error: `Cannot approve a report in status "${report.status}". Only submitted reports can be approved.` };
+      }
+      const result = await client.query(
+        `UPDATE expense_reports SET status = 'approved', updated_at = now()
+         WHERE id = $1 AND status = 'submitted'`,
+        [report.id],
+      );
+      if (result.rowCount === 0) return { ok: false, error: 'Cannot approve this report; it is no longer submitted.' };
+      await addStatusEvent(client, report.id, 'submitted', 'approved', actorId);
+      return { ok: true };
+    }
+
+    if (action === 'reject') {
+      if (report.status !== 'submitted') {
+        return { ok: false, error: `Cannot reject a report in status "${report.status}". Only submitted reports can be rejected.` };
+      }
+      if (!reason?.trim()) return { ok: false, error: 'A rejection reason is required' };
+
+      const result = await client.query(
+        `UPDATE expense_reports SET status = 'draft', submitted_at = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'submitted'`,
+        [report.id],
+      );
+      if (result.rowCount === 0) return { ok: false, error: 'Cannot reject this report; it is no longer submitted.' };
+
+      await addStatusEvent(client, report.id, 'submitted', 'rejected', actorId, reason.trim());
+      await addStatusEvent(client, report.id, 'rejected', 'draft', actorId, 'Returned to draft after rejection');
+      return { ok: true };
+    }
+
+    if (report.status !== 'approved') {
+      return { ok: false, error: `Cannot mark paid a report in status "${report.status}". Only approved reports can be marked paid.` };
+    }
+
+    const result = await client.query(
+      `UPDATE expense_reports SET status = 'paid', updated_at = now()
+       WHERE id = $1 AND status = 'approved'`,
+      [report.id],
+    );
+    if (result.rowCount === 0) return { ok: false, error: 'Cannot mark paid; report is no longer approved.' };
+
+    await addStatusEvent(client, report.id, 'approved', 'paid', actorId);
+    return { ok: true };
+  });
 }
 
-  if (action === 'approve') {
-    if (report.status !== 'submitted') {
-      return { ok: false, error: `Cannot approve a report in status "${report.status}". Only submitted reports can be approved.` };
-    }
-    const info = db.prepare(
-      `UPDATE expense_reports SET status = 'approved', updated_at = datetime('now')
-       WHERE id = ? AND status = 'submitted'`,
-    ).run(report.id);
-    if (info.changes === 0) return { ok: false, error: 'Cannot approve this report; it is no longer submitted.' };
-    addStatusEvent(report.id, 'submitted', 'approved', actorId);
-    return { ok: true };
-  }
-
-  if (action === 'reject') {
-    if (report.status !== 'submitted') {
-      return { ok: false, error: `Cannot reject a report in status "${report.status}". Only submitted reports can be rejected.` };
-    }
-    if (!reason?.trim()) return { ok: false, error: 'A rejection reason is required' };
-
-    const info = db.prepare(
-      `UPDATE expense_reports SET status = 'draft', submitted_at = NULL, updated_at = datetime('now')
-       WHERE id = ? AND status = 'submitted'`,
-    ).run(report.id);
-    if (info.changes === 0) return { ok: false, error: 'Cannot reject this report; it is no longer submitted.' };
-
-    addStatusEvent(report.id, 'submitted', 'rejected', actorId, reason.trim());
-    addStatusEvent(report.id, 'rejected', 'draft', actorId, 'Returned to draft after rejection');
-    return { ok: true };
-  }
-
-  if (report.status !== 'approved') {
-    return { ok: false, error: `Cannot mark paid a report in status "${report.status}". Only approved reports can be marked paid.` };
-  }
-
-  const info = db.prepare(
-    `UPDATE expense_reports SET status = 'paid', updated_at = datetime('now')
-     WHERE id = ? AND status = 'approved'`,
-  ).run(report.id);
-  if (info.changes === 0) return { ok: false, error: 'Cannot mark paid; report is no longer approved.' };
-
-  addStatusEvent(report.id, 'approved', 'paid', actorId);
-  return { ok: true };
-}
-
-function respondDecide(res: Response, reportId: number, result: ReturnType<typeof decide>) {
+async function respondDecide(res: Response, reportId: number, result: DecisionResult) {
   if (!result.ok) {
     const status =
-  result.code === 'not_found'
-    ? 404
-    : result.code === 'self_owner' || result.code === 'not_assigned'
-      ? 403
-      : 400;
+      result.code === 'not_found'
+        ? 404
+        : result.code === 'self_owner' || result.code === 'not_assigned'
+          ? 403
+          : 400;
     return res.status(status).json({ error: result.error });
   }
-  res.json({ report: serializeReport(reportId) });
+  res.json({ report: await serializeReport(reportId) });
 }
 
 function assertDraftOwner(report: ReportRow, userId: number) {
@@ -180,29 +243,29 @@ function assertDraftOwner(report: ReportRow, userId: number) {
   return null;
 }
 
-function serializeReport(id: number) {
-  const report = getReport(id);
+async function serializeReport(id: number, db: Queryable = pgPool) {
+  const report = await getReport(id, db);
   if (!report) return null;
 
-  const lines = db
-    .prepare(
-      `SELECT * FROM expense_lines
-       WHERE report_id = ?
-       ORDER BY spent_on, id`,
-    )
-    .all(id) as ExpenseLineRow[];
+  const lineResult = await db.query<ExpenseLineRow>(
+    `SELECT ${LINE_COLUMNS}
+     FROM expense_lines
+     WHERE report_id = $1
+     ORDER BY spent_on, id`,
+    [id],
+  );
 
-  const approvers = getApprovers(id);
+  const approvers = await getApprovers(id, db);
 
   return {
     ...report,
-    lines: lines.map(serializeLine),
+    lines: lineResult.rows.map(serializeLine),
     approvers,
   };
 }
 
-function loadOwnedDraft(req: Request, res: Response) {
-  const report = getReport(Number(req.params.id));
+async function loadOwnedDraft(req: Request, res: Response) {
+  const report = await getReport(Number(req.params.id));
   if (!report) {
     res.status(404).json({ error: 'Report not found' });
     return null;
@@ -215,7 +278,7 @@ function loadOwnedDraft(req: Request, res: Response) {
   return report;
 }
 
-reportsRouter.get('/', requireAuth, (req, res) => {
+reportsRouter.get('/', requireAuth, asyncHandler(async (req, res) => {
   const user = req.user!;
 
   const q = String(req.query.q || '').trim();
@@ -261,64 +324,29 @@ reportsRouter.get('/', requireAuth, (req, res) => {
   const offset = (page - 1) * pageSize;
 
   const where: string[] = [];
-  const params: (string | number)[] = [];
-
-  /*
-   * ---------------------------------------------------------
-   * 1. BASE AUTHORIZATION
-   * ---------------------------------------------------------
-   *
-   * Employees:
-   *   - only their own reports
-   *
-   * Approvers:
-   *   - their own reports
-   *   - other users' submitted/approved/paid reports
-   *
-   * An approver cannot see somebody else's draft.
-   */
+  const params: unknown[] = [];
 
   if (user.role !== 'approver' || mine) {
-    where.push('expense_reports.owner_id = ?');
-    params.push(user.id);
+    where.push(`expense_reports.owner_id = ${nextParam(params, user.id)}`);
   } else {
     where.push(
       `(
-        expense_reports.owner_id = ?
+        expense_reports.owner_id = ${nextParam(params, user.id)}
         OR expense_reports.status IN ('submitted', 'approved', 'paid')
       )`,
     );
-
-    params.push(user.id);
   }
-
-  /*
-   * ---------------------------------------------------------
-   * 2. SEARCH
-   * ---------------------------------------------------------
-   *
-   * Search report title and owner information.
-   */
 
   if (q) {
+    const search = `%${q}%`;
     where.push(
       `(
-        expense_reports.title LIKE ?
-        OR users.name LIKE ?
-        OR users.email LIKE ?
+        expense_reports.title ILIKE ${nextParam(params, search)}
+        OR users.name ILIKE ${nextParam(params, search)}
+        OR users.email ILIKE ${nextParam(params, search)}
       )`,
     );
-
-    const search = `%${q}%`;
-
-    params.push(search, search, search);
   }
-
-  /*
-   * ---------------------------------------------------------
-   * 3. STATUS FILTER
-   * ---------------------------------------------------------
-   */
 
   if (status) {
     const validStatuses = [
@@ -334,15 +362,8 @@ reportsRouter.get('/', requireAuth, (req, res) => {
       });
     }
 
-    where.push('expense_reports.status = ?');
-    params.push(status);
+    where.push(`expense_reports.status = ${nextParam(params, status)}`);
   }
-
-  /*
-   * ---------------------------------------------------------
-   * 4. OWNER FILTER
-   * ---------------------------------------------------------
-   */
 
   if (ownerId !== null) {
     if (!Number.isInteger(ownerId) || ownerId <= 0) {
@@ -351,15 +372,8 @@ reportsRouter.get('/', requireAuth, (req, res) => {
       });
     }
 
-    where.push('expense_reports.owner_id = ?');
-    params.push(ownerId);
+    where.push(`expense_reports.owner_id = ${nextParam(params, ownerId)}`);
   }
-
-  /*
-   * ---------------------------------------------------------
-   * 5. APPROVER FILTER
-   * ---------------------------------------------------------
-   */
 
   if (approverId !== null) {
     if (!Number.isInteger(approverId) || approverId <= 0) {
@@ -373,18 +387,10 @@ reportsRouter.get('/', requireAuth, (req, res) => {
         SELECT 1
         FROM report_approvers ra
         WHERE ra.report_id = expense_reports.id
-          AND ra.approver_id = ?
+          AND ra.approver_id = ${nextParam(params, approverId)}
       )`,
     );
-
-    params.push(approverId);
   }
-
-  /*
-   * ---------------------------------------------------------
-   * 6. ASSIGNED-TO-ME FILTER
-   * ---------------------------------------------------------
-   */
 
   if (assignedToMe) {
     if (user.role !== 'approver') {
@@ -398,32 +404,16 @@ reportsRouter.get('/', requireAuth, (req, res) => {
         SELECT 1
         FROM report_approvers ra
         WHERE ra.report_id = expense_reports.id
-          AND ra.approver_id = ?
+          AND ra.approver_id = ${nextParam(params, user.id)}
       )`,
     );
-
-    params.push(user.id);
   }
-
-  /*
-   * ---------------------------------------------------------
-   * 7. ARCHIVED FILTER
-   * ---------------------------------------------------------
-   */
 
   where.push(
     archived
       ? 'expense_reports.archived_at IS NOT NULL'
       : 'expense_reports.archived_at IS NULL',
   );
-
-  /*
-   * ---------------------------------------------------------
-   * 8. SAFE SORTING
-   * ---------------------------------------------------------
-   *
-   * Never put raw user input directly into ORDER BY.
-   */
 
   const sortColumns: Record<string, string> = {
     created_at: 'expense_reports.created_at',
@@ -440,56 +430,46 @@ reportsRouter.get('/', requireAuth, (req, res) => {
     ? `WHERE ${where.join(' AND ')}`
     : '';
 
-  /*
-   * ---------------------------------------------------------
-   * 9. TOTAL COUNT
-   * ---------------------------------------------------------
-   */
+  const countResult = await query<{ total: number }>(
+    `SELECT COUNT(*)::int AS total
+     FROM expense_reports
+     JOIN users
+       ON users.id = expense_reports.owner_id
+     ${whereSql}`,
+    params,
+  );
 
-  const countRow = db
-    .prepare(
-      `SELECT COUNT(*) AS total
-       FROM expense_reports
-       JOIN users
-         ON users.id = expense_reports.owner_id
-       ${whereSql}`,
-    )
-    .get(...params) as { total: number };
+  const total = Number(countResult.rows[0].total);
 
-  const total = Number(countRow.total);
+  const pageParams = [...params];
+  const limitParam = nextParam(pageParams, pageSize);
+  const offsetParam = nextParam(pageParams, offset);
 
-  /*
-   * ---------------------------------------------------------
-   * 10. PAGINATED DATA
-   * ---------------------------------------------------------
-   */
-
-  const rows = db
-    .prepare(
-      `SELECT expense_reports.*,
-              ${TOTAL_SQL} AS total_cents,
-              users.name AS owner_name,
-              users.email AS owner_email
-       FROM expense_reports
-       JOIN users
-         ON users.id = expense_reports.owner_id
-       ${whereSql}
-       ORDER BY ${sortColumn} ${order},
-                expense_reports.id DESC
-       LIMIT ?
-       OFFSET ?`,
-    )
-    .all(...params, pageSize, offset);
+  const rows = await query(
+    `SELECT ${REPORT_COLUMNS},
+            ${TOTAL_SQL} AS total_cents,
+            users.name AS owner_name,
+            users.email AS owner_email
+     FROM expense_reports
+     JOIN users
+       ON users.id = expense_reports.owner_id
+     ${whereSql}
+     ORDER BY ${sortColumn} ${order},
+              expense_reports.id DESC
+     LIMIT ${limitParam}
+     OFFSET ${offsetParam}`,
+    pageParams,
+  );
 
   res.json({
-    items: rows,
+    items: rows.rows,
     total,
     page,
     pageSize,
   });
-});
+}));
 
-reportsRouter.post('/', requireAuth, (req, res) => {
+reportsRouter.post('/', requireAuth, asyncHandler(async (req, res) => {
   const body = z
     .object({
       title: z.string().min(1),
@@ -499,18 +479,18 @@ reportsRouter.post('/', requireAuth, (req, res) => {
     .safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: 'title, period_start, period_end required' });
 
-  const info = db
-    .prepare(
-      `INSERT INTO expense_reports (owner_id, title, period_start, period_end, status)
-       VALUES (?, ?, ?, ?, 'draft')`,
-    )
-    .run(req.user!.id, body.data.title, body.data.period_start, body.data.period_end);
+  const result = await query<{ id: number }>(
+    `INSERT INTO expense_reports (owner_id, title, period_start, period_end, status)
+     VALUES ($1, $2, $3, $4, 'draft')
+     RETURNING id`,
+    [req.user!.id, body.data.title, body.data.period_start, body.data.period_end],
+  );
 
-  const id = Number(info.lastInsertRowid);
-  res.status(201).json({ report: serializeReport(id) });
-});
+  const id = result.rows[0].id;
+  res.status(201).json({ report: await serializeReport(id) });
+}));
 
-reportsRouter.get('/queue', requireAuth, requireApprover, (req, res) => {
+reportsRouter.get('/queue', requireAuth, requireApprover, asyncHandler(async (req, res) => {
   const assignedToMe =
     req.query.assignedToMe === '1' ||
     req.query.assignedToMe === 'true';
@@ -521,6 +501,7 @@ reportsRouter.get('/queue', requireAuth, requireApprover, (req, res) => {
     Math.max(1, Number(req.query.pageSize) || 20),
   );
 
+  const params: unknown[] = [];
   const where = assignedToMe
     ? `
       WHERE expense_reports.status = 'submitted'
@@ -528,51 +509,49 @@ reportsRouter.get('/queue', requireAuth, requireApprover, (req, res) => {
           SELECT 1
           FROM report_approvers ra
           WHERE ra.report_id = expense_reports.id
-            AND ra.approver_id = ?
+            AND ra.approver_id = ${nextParam(params, req.user!.id)}
         )
     `
     : `
       WHERE expense_reports.status = 'submitted'
     `;
 
-  const params = assignedToMe
-    ? [req.user!.id]
-    : [];
+  const countResult = await query<{ total: number }>(
+    `SELECT COUNT(*)::int AS total
+     FROM expense_reports
+     ${where}`,
+    params,
+  );
 
-  const countRow = db
-    .prepare(
-      `SELECT COUNT(*) AS total
-       FROM expense_reports
-       ${where}`,
-    )
-    .get(...params) as { total: number };
+  const total = Number(countResult.rows[0].total);
 
-  const total = Number(countRow.total);
+  const pageParams = [...params];
+  const limitParam = nextParam(pageParams, pageSize);
+  const offsetParam = nextParam(pageParams, (page - 1) * pageSize);
 
-  const rows = db
-    .prepare(
-      `SELECT expense_reports.*, ${TOTAL_SQL} AS total_cents,
-              users.name AS owner_name,
-              users.email AS owner_email
-       FROM expense_reports
-       JOIN users ON users.id = expense_reports.owner_id
-       ${where}
-       ORDER BY expense_reports.submitted_at ASC,
-                expense_reports.id ASC
-       LIMIT ? OFFSET ?`,
-    )
-    .all(...params, pageSize, (page - 1) * pageSize);
+  const rows = await query(
+    `SELECT ${REPORT_COLUMNS}, ${TOTAL_SQL} AS total_cents,
+            users.name AS owner_name,
+            users.email AS owner_email
+     FROM expense_reports
+     JOIN users ON users.id = expense_reports.owner_id
+     ${where}
+     ORDER BY expense_reports.submitted_at ASC,
+              expense_reports.id ASC
+     LIMIT ${limitParam} OFFSET ${offsetParam}`,
+    pageParams,
+  );
 
   res.json({
-    items: rows,
+    items: rows.rows,
     total,
     page,
     pageSize,
   });
-});
+}));
 
-reportsRouter.get('/:id/approvers', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.get('/:id/approvers', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
 
   if (!report) {
     return res.status(404).json({ error: 'Report not found' });
@@ -582,11 +561,10 @@ reportsRouter.get('/:id/approvers', requireAuth, (req, res) => {
     return res.status(403).json({ error: 'You cannot view this report' });
   }
 
-  res.json({ approvers: getApprovers(report.id) });
-});
+  res.json({ approvers: await getApprovers(report.id) });
+}));
 
-
-reportsRouter.post('/bulk-decide', requireAuth, requireApprover, (req, res) => {
+reportsRouter.post('/bulk-decide', requireAuth, requireApprover, asyncHandler(async (req, res) => {
   const body = z
     .object({
       reportIds: z.array(z.number().int().positive()).min(1).max(100),
@@ -609,20 +587,21 @@ reportsRouter.post('/bulk-decide', requireAuth, requireApprover, (req, res) => {
     });
   }
 
-  const results = reportIds.map((reportId) => {
-    const result = decide(
+  const results = [];
+  for (const reportId of reportIds) {
+    const result = await decide(
       reportId,
       req.user!.id,
       action,
       reason,
     );
 
-    return {
+    results.push({
       reportId,
       ok: result.ok,
       ...(result.ok ? {} : { error: result.error }),
-    };
-  });
+    });
+  }
 
   const succeeded = results.filter((result) => result.ok).length;
   const failed = results.length - succeeded;
@@ -633,43 +612,42 @@ reportsRouter.post('/bulk-decide', requireAuth, requireApprover, (req, res) => {
     succeeded,
     failed,
   });
-});
+}));
 
+reportsRouter.get('/payment-export', requireAuth, requireApprover, asyncHandler(async (_req, res) => {
+  const result = await query<{
+    id: number;
+    title: string;
+    period_start: string;
+    period_end: string;
+    owner_name: string;
+    owner_email: string;
+    total_cents: number;
+    status: string;
+    submitted_at: string | null;
+    updated_at: string;
+  }>(
+    `SELECT
+       expense_reports.id,
+       expense_reports.title,
+       expense_reports.period_start,
+       expense_reports.period_end,
+       users.name AS owner_name,
+       users.email AS owner_email,
+       ${TOTAL_SQL} AS total_cents,
+       expense_reports.status,
+       to_char(expense_reports.submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS submitted_at,
+       to_char(expense_reports.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+     FROM expense_reports
+     JOIN users
+       ON users.id = expense_reports.owner_id
+     WHERE expense_reports.status = 'approved'
+       AND expense_reports.archived_at IS NULL
+     ORDER BY expense_reports.updated_at DESC,
+              expense_reports.id DESC`,
+  );
 
-reportsRouter.get('/payment-export', requireAuth, requireApprover, (req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT
-         expense_reports.id,
-         expense_reports.title,
-         expense_reports.period_start,
-         expense_reports.period_end,
-         users.name AS owner_name,
-         users.email AS owner_email,
-         ${TOTAL_SQL} AS total_cents,
-         expense_reports.status,
-         expense_reports.submitted_at,
-         expense_reports.updated_at
-       FROM expense_reports
-       JOIN users
-         ON users.id = expense_reports.owner_id
-       WHERE expense_reports.status = 'approved'
-         AND expense_reports.archived_at IS NULL
-       ORDER BY expense_reports.updated_at DESC,
-                expense_reports.id DESC`,
-    )
-    .all() as Array<{
-      id: number;
-      title: string;
-      period_start: string;
-      period_end: string;
-      owner_name: string;
-      owner_email: string;
-      total_cents: number;
-      status: string;
-      submitted_at: string | null;
-      updated_at: string;
-    }>;
+  const rows = result.rows;
 
   const escapeCsv = (value: unknown) => {
     const text = String(value ?? '');
@@ -724,11 +702,10 @@ reportsRouter.get('/payment-export', requireAuth, requireApprover, (req, res) =>
   );
 
   return res.send(csv);
-});
+}));
 
-
-reportsRouter.post('/:id/approvers', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.post('/:id/approvers', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
 
   if (!report) {
     return res.status(404).json({ error: 'Report not found' });
@@ -758,15 +735,13 @@ reportsRouter.post('/:id/approvers', requireAuth, (req, res) => {
     });
   }
 
-  const approver = db
-    .prepare(
-      `SELECT id, role
-       FROM users
-       WHERE id = ?`,
-    )
-    .get(body.data.approver_id) as
-    | { id: number; role: string }
-    | undefined;
+  const approverResult = await query<{ id: number; role: string }>(
+    `SELECT id, role
+     FROM users
+     WHERE id = $1`,
+    [body.data.approver_id],
+  );
+  const approver = approverResult.rows[0];
 
   if (!approver) {
     return res.status(404).json({
@@ -780,20 +755,24 @@ reportsRouter.post('/:id/approvers', requireAuth, (req, res) => {
     });
   }
 
-  db.prepare(
-    `INSERT OR IGNORE INTO report_approvers (report_id, approver_id)
-     VALUES (?, ?)`,
-  ).run(report.id, approver.id);
+  await withPgTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO report_approvers (report_id, approver_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [report.id, approver.id],
+    );
 
-  touchReport(report.id);
+    await touchReport(report.id, client);
+  });
 
   res.json({
-    approvers: getApprovers(report.id),
+    approvers: await getApprovers(report.id),
   });
-});
+}));
 
-reportsRouter.patch('/:id', requireAuth, (req, res) => {
-  const report = loadOwnedDraft(req, res);
+reportsRouter.patch('/:id', requireAuth, asyncHandler(async (req, res) => {
+  const report = await loadOwnedDraft(req, res);
   if (!report) return;
 
   const body = z
@@ -805,32 +784,32 @@ reportsRouter.patch('/:id', requireAuth, (req, res) => {
     .safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: 'Invalid fields' });
 
-  db.prepare(
+  await query(
     `UPDATE expense_reports SET
-       title = COALESCE(?, title),
-       period_start = COALESCE(?, period_start),
-       period_end = COALESCE(?, period_end),
-       updated_at = datetime('now')
-     WHERE id = ?`,
-  ).run(body.data.title ?? null, body.data.period_start ?? null, body.data.period_end ?? null, report.id);
+       title = COALESCE($1, title),
+       period_start = COALESCE($2, period_start),
+       period_end = COALESCE($3, period_end),
+       updated_at = now()
+     WHERE id = $4`,
+    [body.data.title ?? null, body.data.period_start ?? null, body.data.period_end ?? null, report.id],
+  );
 
-  res.json({ report: serializeReport(report.id) });
-});
+  res.json({ report: await serializeReport(report.id) });
+}));
 
-
-reportsRouter.get('/:id', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.get('/:id', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
 
   if (!canView(report, req.user!.id, req.user!.role)) {
     return res.status(403).json({ error: 'You cannot view this report' });
   }
 
-  res.json({ report: serializeReport(report.id) });
-});
+  res.json({ report: await serializeReport(report.id) });
+}));
 
-reportsRouter.delete('/:id/approvers/:approverId', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.delete('/:id/approvers/:approverId', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
 
   if (!report) {
     return res.status(404).json({ error: 'Report not found' });
@@ -850,28 +829,33 @@ reportsRouter.delete('/:id/approvers/:approverId', requireAuth, (req, res) => {
 
   const approverId = Number(req.params.approverId);
 
-  const info = db
-    .prepare(
+  let rowCount = 0;
+  await withPgTransaction(async (client) => {
+    const result = await client.query(
       `DELETE FROM report_approvers
-       WHERE report_id = ? AND approver_id = ?`,
-    )
-    .run(report.id, approverId);
+       WHERE report_id = $1 AND approver_id = $2`,
+      [report.id, approverId],
+    );
 
-  if (info.changes === 0) {
+    rowCount = result.rowCount ?? 0;
+    if (rowCount > 0) {
+      await touchReport(report.id, client);
+    }
+  });
+
+  if (rowCount === 0) {
     return res.status(404).json({
       error: 'Approver assignment not found',
     });
   }
 
-  touchReport(report.id);
-
   res.json({
-    approvers: getApprovers(report.id),
+    approvers: await getApprovers(report.id),
   });
-});
+}));
 
-reportsRouter.post('/:id/archive', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.post('/:id/archive', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
   if (report.owner_id !== req.user!.id) {
     return res.status(403).json({ error: 'Only the owner can archive a report' });
@@ -885,15 +869,16 @@ reportsRouter.post('/:id/archive', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Report is already archived' });
   }
 
-  db.prepare(
-    `UPDATE expense_reports SET archived_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
-  ).run(report.id);
+  await query(
+    `UPDATE expense_reports SET archived_at = now(), updated_at = now() WHERE id = $1`,
+    [report.id],
+  );
 
-  res.json({ report: serializeReport(report.id) });
-});
+  res.json({ report: await serializeReport(report.id) });
+}));
 
-reportsRouter.post('/:id/restore', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.post('/:id/restore', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
   if (report.owner_id !== req.user!.id) {
     return res.status(403).json({ error: 'Only the owner can restore a report' });
@@ -902,12 +887,13 @@ reportsRouter.post('/:id/restore', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Report is not archived' });
   }
 
-  db.prepare(
-    `UPDATE expense_reports SET archived_at = NULL, updated_at = datetime('now') WHERE id = ?`,
-  ).run(report.id);
+  await query(
+    `UPDATE expense_reports SET archived_at = NULL, updated_at = now() WHERE id = $1`,
+    [report.id],
+  );
 
-  res.json({ report: serializeReport(report.id) });
-});
+  res.json({ report: await serializeReport(report.id) });
+}));
 
 const lineSchema = z.object({
   spent_on: z.string().min(1),
@@ -916,72 +902,90 @@ const lineSchema = z.object({
   description: z.string().min(1),
 });
 
-reportsRouter.post('/:id/lines', requireAuth, (req, res) => {
-  const report = loadOwnedDraft(req, res);
+reportsRouter.post('/:id/lines', requireAuth, asyncHandler(async (req, res) => {
+  const report = await loadOwnedDraft(req, res);
   if (!report) return;
 
   const body = lineSchema.safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: 'Invalid line fields' });
 
-  const info = db
-    .prepare(
+  const line = await withPgTransaction(async (client) => {
+    const result = await client.query<ExpenseLineRow>(
       `INSERT INTO expense_lines (report_id, spent_on, amount_cents, category, description)
-       VALUES (?, ?, ?, ?, ?)`,
-    )
-    .run(report.id, body.data.spent_on, body.data.amount_cents, body.data.category, body.data.description);
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING ${LINE_COLUMNS}`,
+      [report.id, body.data.spent_on, body.data.amount_cents, body.data.category, body.data.description],
+    );
 
-  touchReport(report.id);
-  const line = db.prepare(`SELECT * FROM expense_lines WHERE id = ?`).get(info.lastInsertRowid) as ExpenseLineRow;
-  res.status(201).json({ line: serializeLine(line), total_cents: getReport(report.id)!.total_cents });
-});
+    await touchReport(report.id, client);
+    return result.rows[0];
+  });
 
-reportsRouter.patch('/:id/lines/:lineId', requireAuth, (req, res) => {
-  const report = loadOwnedDraft(req, res);
+  res.status(201).json({ line: serializeLine(line), total_cents: (await getReport(report.id))!.total_cents });
+}));
+
+reportsRouter.patch('/:id/lines/:lineId', requireAuth, asyncHandler(async (req, res) => {
+  const report = await loadOwnedDraft(req, res);
   if (!report) return;
 
   const body = lineSchema.partial().safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: 'Invalid line fields' });
 
-  const line = db
-    .prepare(`SELECT id FROM expense_lines WHERE id = ? AND report_id = ?`)
-    .get(Number(req.params.lineId), report.id) as { id: number } | undefined;
+  const lineResult = await query<{ id: number }>(
+    `SELECT id FROM expense_lines WHERE id = $1 AND report_id = $2`,
+    [Number(req.params.lineId), report.id],
+  );
+  const line = lineResult.rows[0];
   if (!line) return res.status(404).json({ error: 'Line not found' });
 
-  db.prepare(
-    `UPDATE expense_lines SET
-       spent_on = COALESCE(?, spent_on),
-       amount_cents = COALESCE(?, amount_cents),
-       category = COALESCE(?, category),
-       description = COALESCE(?, description)
-     WHERE id = ?`,
-  ).run(
-    body.data.spent_on ?? null,
-    body.data.amount_cents ?? null,
-    body.data.category ?? null,
-    body.data.description ?? null,
-    line.id,
-  );
+  const updated = await withPgTransaction(async (client) => {
+    const result = await client.query<ExpenseLineRow>(
+      `UPDATE expense_lines SET
+         spent_on = COALESCE($1, spent_on),
+         amount_cents = COALESCE($2, amount_cents),
+         category = COALESCE($3, category),
+         description = COALESCE($4, description)
+       WHERE id = $5
+       RETURNING ${LINE_COLUMNS}`,
+      [
+        body.data.spent_on ?? null,
+        body.data.amount_cents ?? null,
+        body.data.category ?? null,
+        body.data.description ?? null,
+        line.id,
+      ],
+    );
 
-  touchReport(report.id);
-  const updated = db.prepare(`SELECT * FROM expense_lines WHERE id = ?`).get(line.id) as ExpenseLineRow;
-  res.json({ line: serializeLine(updated), total_cents: getReport(report.id)!.total_cents });
-});
+    await touchReport(report.id, client);
+    return result.rows[0];
+  });
 
-reportsRouter.delete('/:id/lines/:lineId', requireAuth, (req, res) => {
-  const report = loadOwnedDraft(req, res);
+  res.json({ line: serializeLine(updated), total_cents: (await getReport(report.id))!.total_cents });
+}));
+
+reportsRouter.delete('/:id/lines/:lineId', requireAuth, asyncHandler(async (req, res) => {
+  const report = await loadOwnedDraft(req, res);
   if (!report) return;
 
-  const info = db
-    .prepare(`DELETE FROM expense_lines WHERE id = ? AND report_id = ?`)
-    .run(Number(req.params.lineId), report.id);
-  if (info.changes === 0) return res.status(404).json({ error: 'Line not found' });
+  let rowCount = 0;
+  await withPgTransaction(async (client) => {
+    const result = await client.query(
+      `DELETE FROM expense_lines WHERE id = $1 AND report_id = $2`,
+      [Number(req.params.lineId), report.id],
+    );
+    rowCount = result.rowCount ?? 0;
+    if (rowCount > 0) {
+      await touchReport(report.id, client);
+    }
+  });
 
-  touchReport(report.id);
-  res.json({ ok: true, total_cents: getReport(report.id)!.total_cents });
-});
+  if (rowCount === 0) return res.status(404).json({ error: 'Line not found' });
 
-reportsRouter.post('/:id/submit', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+  res.json({ ok: true, total_cents: (await getReport(report.id))!.total_cents });
+}));
+
+reportsRouter.post('/:id/submit', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
   if (report.owner_id !== req.user!.id) return res.status(403).json({ error: 'Only the report owner may submit it' });
   if (report.archived_at) return res.status(400).json({ error: 'Restore the report before submitting' });
@@ -990,11 +994,11 @@ reportsRouter.post('/:id/submit', requireAuth, (req, res) => {
   }
   if (report.total_cents <= 0) return res.status(400).json({ error: 'Add at least one expense line before submitting' });
 
-  const approverCount = (
-    db
-      .prepare(`SELECT COUNT(*) AS count FROM report_approvers WHERE report_id = ?`)
-      .get(report.id) as { count: number }
-  ).count;
+  const approverCountResult = await query<{ count: number }>(
+    `SELECT COUNT(*)::int AS count FROM report_approvers WHERE report_id = $1`,
+    [report.id],
+  );
+  const approverCount = approverCountResult.rows[0].count;
 
   if (approverCount === 0) {
     return res.status(400).json({
@@ -1002,69 +1006,103 @@ reportsRouter.post('/:id/submit', requireAuth, (req, res) => {
     });
   }
 
-  db.prepare(
-    `UPDATE expense_reports SET status = 'submitted', submitted_at = datetime('now'), updated_at = datetime('now')
-     WHERE id = ? AND status = 'draft'`,
-  ).run(report.id);
+  await withPgTransaction(async (client) => {
+    await client.query(
+      `UPDATE expense_reports SET status = 'submitted', submitted_at = now(), updated_at = now()
+       WHERE id = $1 AND status = 'draft'`,
+      [report.id],
+    );
 
-  addStatusEvent(report.id, 'draft', 'submitted', req.user!.id);
-  res.json({ report: serializeReport(report.id) });
-});
+    await addStatusEvent(client, report.id, 'draft', 'submitted', req.user!.id);
+  });
 
-reportsRouter.post('/:id/approve', requireAuth, (req, res) => {
+  res.json({ report: await serializeReport(report.id) });
+}));
+
+reportsRouter.post('/:id/approve', requireAuth, asyncHandler(async (req, res) => {
   if (req.user!.role !== 'approver') return res.status(403).json({ error: 'Approver role required' });
   const id = Number(req.params.id);
-  respondDecide(res, id, decide(id, req.user!.id, 'approve'));
-});
+  await respondDecide(res, id, await decide(id, req.user!.id, 'approve'));
+}));
 
-reportsRouter.post('/:id/reject', requireAuth, (req, res) => {
+reportsRouter.post('/:id/reject', requireAuth, asyncHandler(async (req, res) => {
   if (req.user!.role !== 'approver') return res.status(403).json({ error: 'Approver role required' });
   const id = Number(req.params.id);
   const reason = typeof req.body?.reason === 'string' ? req.body.reason : '';
-  respondDecide(res, id, decide(id, req.user!.id, 'reject', reason));
-});
+  await respondDecide(res, id, await decide(id, req.user!.id, 'reject', reason));
+}));
 
-reportsRouter.post('/:id/pay', requireAuth, (req, res) => {
+reportsRouter.post('/:id/pay', requireAuth, asyncHandler(async (req, res) => {
   if (req.user!.role !== 'approver') return res.status(403).json({ error: 'Approver role required' });
   const id = Number(req.params.id);
-  respondDecide(res, id, decide(id, req.user!.id, 'pay'));
-});
+  await respondDecide(res, id, await decide(id, req.user!.id, 'pay'));
+}));
 
-reportsRouter.get('/:id/history', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.get('/:id/history', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
   if (!canView(report, req.user!.id, req.user!.role)) return res.status(403).json({ error: 'You cannot view this report' });
 
-  const events = db.prepare(
-    `SELECT se.*, u.name AS actor_name FROM status_events se
+  const events = await query(
+    `SELECT
+       se.id,
+       se.report_id,
+       se.old_status,
+       se.new_status,
+       se.actor_id,
+       se.reason,
+       to_char(se.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+       u.name AS actor_name
+     FROM status_events se
      JOIN users u ON u.id = se.actor_id
-     WHERE se.report_id = ? ORDER BY se.created_at, se.id`,
-  ).all(report.id);
+     WHERE se.report_id = $1 ORDER BY se.created_at, se.id`,
+    [report.id],
+  );
 
-  const comments = db.prepare(
-    `SELECT c.*, u.name AS author_name FROM comments c
+  const comments = await query(
+    `SELECT
+       c.id,
+       c.report_id,
+       c.author_id,
+       c.body,
+       to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+       u.name AS author_name
+     FROM comments c
      JOIN users u ON u.id = c.author_id
-     WHERE c.report_id = ? ORDER BY c.created_at, c.id`,
-  ).all(report.id);
+     WHERE c.report_id = $1 ORDER BY c.created_at, c.id`,
+    [report.id],
+  );
 
-  res.json({ events, comments });
-});
+  res.json({ events: events.rows, comments: comments.rows });
+}));
 
-reportsRouter.post('/:id/comments', requireAuth, (req, res) => {
-  const report = getReport(Number(req.params.id));
+reportsRouter.post('/:id/comments', requireAuth, asyncHandler(async (req, res) => {
+  const report = await getReport(Number(req.params.id));
   if (!report) return res.status(404).json({ error: 'Report not found' });
   if (!canView(report, req.user!.id, req.user!.role)) return res.status(403).json({ error: 'You cannot comment on this report' });
 
   const body = z.object({ body: z.string().min(1) }).safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: 'Comment body required' });
 
-  const info = db.prepare(`INSERT INTO comments (report_id, author_id, body) VALUES (?, ?, ?)`)
-    .run(report.id, req.user!.id, body.data.body);
+  const result = await query(
+    `INSERT INTO comments (report_id, author_id, body)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [report.id, req.user!.id, body.data.body],
+  );
 
-  const comment = db.prepare(
-    `SELECT c.*, u.name AS author_name FROM comments c
-     JOIN users u ON u.id = c.author_id WHERE c.id = ?`,
-  ).get(info.lastInsertRowid);
+  const comment = await query(
+    `SELECT
+       c.id,
+       c.report_id,
+       c.author_id,
+       c.body,
+       to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+       u.name AS author_name
+     FROM comments c
+     JOIN users u ON u.id = c.author_id WHERE c.id = $1`,
+    [result.rows[0].id],
+  );
 
-  res.status(201).json({ comment });
-});
+  res.status(201).json({ comment: comment.rows[0] });
+}));
