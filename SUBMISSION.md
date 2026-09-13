@@ -2,8 +2,8 @@
 
 ## Links
 
-- **GitHub repository:** <public repo URL>
-- **Live application:** <deployed URL>
+- **GitHub repository:** https://github.com/Github-Shashwat/Busy-expense-reimbursement 
+**Live application:** <deployed URL>
 
 ## Notes for the reviewer
 
@@ -47,13 +47,19 @@
 | 9 | Immutable history | Done | Append-only status events and comments; no edit/delete APIs |
 | 10 | Stale-approval alerts | Done | Configurable `STALE_DAYS` / `REDISMISS_DAYS`; navigation badge and dismissal |
 
+## Optional stretch goal
+
+| Feature | Status | Notes |
+|---|---|---|
+| Per-category spending limits / policy warnings | Done | Expense lines are checked against category-specific limits. Warnings are generated server-side and displayed in the report UI; they do not block submission. Includes unit tests and a dedicated demo report showing an over-limit expense. |
+
 ## How much time did you actually spend?
 
 About **12 hours** across planning, implementation, documentation, and review.
 
 ## What would you do next, with another 12 hours?
 
-I would add automated API tests for lifecycle and authorization edge cases, improve production database scalability with PostgreSQL if needed, and add receipt file uploads with appropriate storage and access controls.
+I would expand automated API coverage for lifecycle and authorization edge cases, improve production database scalability with PostgreSQL if needed, and add receipt file uploads with appropriate storage and access controls.
 
 ## What are you least happy with in this codebase, and why?
 
